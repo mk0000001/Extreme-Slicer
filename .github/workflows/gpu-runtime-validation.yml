@@ -41,7 +41,7 @@ jobs:
           use-github-cache: true
           use-local-cache: true
       - name: Install Vulkan compiler and development headers
-        run: choco install vulkan-sdk --yes --no-progress
+        run: choco install vulkan-sdk --version=1.4.363 --yes --no-progress
       - name: Fetch verified Boost headers
         shell: pwsh
         run: |
@@ -55,6 +55,15 @@ jobs:
           $vk = (Get-ChildItem 'C:/VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
           if (-not $vk) { throw 'Vulkan SDK missing' }
           "VULKAN_SDK=$vk" | Add-Content $env:GITHUB_ENV
+      - name: Fetch verified official Vulkan runtime components
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkan-runtime-components.zip' -OutFile vulkan-runtime-components.zip
+          if ((Get-FileHash vulkan-runtime-components.zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'a25a927aa8b9f0371048f1861cf88ac3b9bc9b1fb332c42d897c8ab32695769a') { throw 'Vulkan runtime digest mismatch' }
+          Expand-Archive vulkan-runtime-components.zip vulkan-runtime
+          $runtime = (Get-ChildItem vulkan-runtime -Directory | Select-Object -First 1).FullName
+          if (-not (Test-Path "$runtime/x64/vulkan-1.dll")) { throw 'Unexpected Vulkan runtime layout' }
+          "VULKAN_RUNTIME_DIR=$runtime" | Add-Content $env:GITHUB_ENV
       - name: Configure the actual CUDA and Vulkan backends
         shell: pwsh
         run: |
@@ -74,13 +83,14 @@ jobs:
           Copy-Item build-gpu/Release/*.exe gpu-diagnostic
           Copy-Item build-gpu/resources/vulkan/*.spv gpu-diagnostic/resources/vulkan
           $cudart = Get-ChildItem "$env:CUDA_PATH/bin" -Filter 'cudart64_12.dll' | Select-Object -First 1
-          $loader = Get-Item "$env:VULKAN_SDK/Bin/vulkan-1.dll"
+          $loader = Get-Item "$env:VULKAN_RUNTIME_DIR/x64/vulkan-1.dll"
           if (-not $cudart -or -not $loader) { throw 'Portable GPU runtime missing' }
           Copy-Item $cudart.FullName gpu-diagnostic
           Copy-Item $loader.FullName gpu-diagnostic
           Copy-Item LICENSE.txt gpu-diagnostic/LICENSE-AGPL-3.0.txt
           New-Item -ItemType Directory -Path gpu-diagnostic/licenses -Force | Out-Null
           Get-ChildItem "$env:CUDA_PATH" -File | Where-Object Name -Match 'LICENSE|EULA' | Copy-Item -Destination gpu-diagnostic/licenses
+          Copy-Item "$env:VULKAN_RUNTIME_DIR/VulkanRT-License.txt" gpu-diagnostic/licenses
           if (Test-Path "$env:VULKAN_SDK/License") { Copy-Item "$env:VULKAN_SDK/License" gpu-diagnostic/licenses/VulkanSDK -Recurse }
           git rev-parse HEAD | Set-Content gpu-diagnostic/SOURCE-COMMIT.txt
           'This is a compute diagnostic, not the slicer app. Run slicer-gpu-selftest.exe resources/vulkan cuda or vulkan. Both must dispatch and validate; no speedup is claimed.' | Set-Content gpu-diagnostic/README.txt
