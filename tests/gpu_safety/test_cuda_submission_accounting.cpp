@@ -1,3 +1,5 @@
+#include "GpuExactGeometry.hpp"
+#include <system_error>
 // Exercise the real facade and CUDA acceptance gate with a simulated device
 // boundary that returns one incorrect result. This is not hardware evidence.
 #include "VulkanSlicer.hpp"

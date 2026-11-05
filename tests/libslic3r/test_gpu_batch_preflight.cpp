@@ -1,5 +1,9 @@
+#include "libslic3r/Gpu/GpuExactGeometry.hpp"
+#include <cstddef>
+#include <utility>
 #if __has_include(<catch2/catch_all.hpp>)
-#include <catch2/catch_all.hpp>
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #else
 #include <catch2/catch.hpp>
 #endif

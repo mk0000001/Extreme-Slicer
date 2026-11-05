@@ -1,3 +1,4 @@
+#include "GpuExactGeometry.hpp"
 #include "VulkanSlicer.hpp"
 #include "GpuBatchSafety.hpp"
 #include "CudaSlicer.hpp"

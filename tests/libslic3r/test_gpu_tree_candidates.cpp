@@ -1,3 +1,4 @@
+#include <exception>
 #include "../../src/libslic3r/Gpu/TreeContourCandidates.hpp"
 #include <cstddef>
 #include <cstdint>

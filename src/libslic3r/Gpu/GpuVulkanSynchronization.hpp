@@ -1,4 +1,5 @@
 #pragma once
+#ifdef SLIC3R_ENABLE_VULKAN_SLICER
 #include <vulkan/vulkan.h>
 namespace Slic3r::Gpu {
 inline VkResult end_compute_readback(VkCommandBuffer command,
@@ -13,3 +14,4 @@ inline VkResult end_compute_readback(VkCommandBuffer command,
     return end(command);
 }
 }
+#endif
