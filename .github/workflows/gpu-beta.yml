@@ -1,8 +1,8 @@
-name: Orca 2.5 RC full GPU app validation
+name: Orca 2.5 RC direct include full GPU app validation
 
 on:
   push:
-    branches: [ci/gpu-rc-arachne-beta-20261106]
+    branches: [ci/gpu-rc-include-beta-20261106]
   workflow_dispatch:
 
 concurrency:
