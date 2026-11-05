@@ -2,7 +2,7 @@ name: Orca 2.5 RC full GPU app validation
 
 on:
   push:
-    branches: [ci/gpu-beta-2.5-final]
+    branches: [ci/gpu-rc-arachne-beta-20261106]
   workflow_dispatch:
 
 concurrency:
