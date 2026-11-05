@@ -1,3 +1,7 @@
+#include "../../src/libslic3r/Gpu/GpuExactGeometry.hpp"
+#include "../../src/libslic3r/Gpu/GpuBatchSafety.hpp"
+#include "../../src/libslic3r/Gpu/VulkanSlicer.hpp"
+#include <exception>
 // Build this standalone fixture with CudaSlicer.cpp only: it includes the
 // production implementation to test its private recorder without test hooks.
 #include "../../src/libslic3r/Gpu/VulkanSlicer.cpp"

@@ -34,6 +34,7 @@ if(SLIC3R_ENABLE_VULKAN_SLICER)
     target_link_libraries(slicer_gpu_core PRIVATE Vulkan::Vulkan)
     add_executable(gpu_vulkan_readback_test test_vulkan_readback.cpp)
     target_compile_features(gpu_vulkan_readback_test PRIVATE cxx_std_17)
+    target_compile_definitions(gpu_vulkan_readback_test PRIVATE SLIC3R_ENABLE_VULKAN_SLICER=1)
     target_include_directories(gpu_vulkan_readback_test PRIVATE "${GPU_SOURCE_DIR}" ${Vulkan_INCLUDE_DIRS})
     # This boundary contract must retain assertions in Release too.
     if(MSVC)

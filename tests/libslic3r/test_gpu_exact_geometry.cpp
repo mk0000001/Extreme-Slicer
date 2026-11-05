@@ -1,5 +1,11 @@
+#include <string>
+#include <system_error>
+#include <vector>
+#include <cstdint>
+#include <ios>
+#include <utility>
 #if __has_include(<catch2/catch_all.hpp>)
-#include <catch2/catch_all.hpp>
+#include <catch2/catch_test_macros.hpp>
 #else
 #include <catch2/catch.hpp>
 #endif
@@ -17,6 +23,9 @@
 #include <limits>
 #include <stdexcept>
 #include <cstdlib>
+#ifdef _WIN32
+#include <stdlib.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <chrono>
