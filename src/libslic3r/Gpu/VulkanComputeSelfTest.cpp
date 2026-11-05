@@ -1,8 +1,10 @@
 #include "VulkanSlicer.hpp"
 #include "GpuBatchSafety.hpp"
+#include "CudaSlicer.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -16,6 +18,12 @@ int main(int argc, char** argv)
     const std::string mode(argv[2]);
     if (mode != "cpu" && mode != "cuda" && mode != "vulkan" && mode != "auto")
         return 64;
+    if (const char* environment = std::getenv("SLIC3R_GPU_BACKEND")) {
+        if (mode != environment) {
+            std::cerr << "SLIC3R_GPU_BACKEND conflicts with the requested selftest backend.\n";
+            return 64;
+        }
+    }
     using namespace Slic3r::Gpu;
     VulkanSlicerBackend::set_shader_directory(argv[1]);
     VulkanSlicerBackend::set_compute_enabled(mode == "vulkan" || mode == "auto");
@@ -23,6 +31,25 @@ int main(int argc, char** argv)
     VulkanSlicerBackend::set_backend_preference(mode == "vulkan" ? ComputeBackendPreference::Vulkan :
         mode == "cuda" ? ComputeBackendPreference::Cuda : mode == "auto" ? ComputeBackendPreference::Auto : ComputeBackendPreference::Cpu);
     VulkanSlicerBackend::begin_slicing_session();
+    const auto unsafe = VulkanSlicerBackend::dispatch_vertical_intersections(
+        {{{{0, 3'000'000'000}, {4'000'000'000, 3'000'000'000}}, 2'000'000'000, 0}});
+    if (unsafe.dispatched || !unsafe.intersections.empty() ||
+        VulkanSlicerBackend::query_runtime_stats().queue_submissions != 0)
+        return 3;
+    if (mode != "cpu") {
+        bool available = false;
+        if (mode == "cuda" || mode == "auto")
+            available = CudaSlicerBackend::query_capabilities().runtime_available;
+        if (mode == "vulkan" || mode == "auto") {
+            const auto capabilities = VulkanSlicerBackend::query_capabilities();
+            available = available || std::any_of(capabilities.devices.begin(), capabilities.devices.end(),
+                [](const auto& device) { return VulkanSlicerBackend::supports_deterministic_geometry(device); });
+        }
+        if (!available) {
+            std::cerr << "No compiled, supported device is available for the requested backend.\n";
+            return 77;
+        }
+    }
     std::vector<VulkanVerticalIntersectionRequest> requests;
     for (uint64_t index = 0; index < 1024; ++index) {
         const bool reverse = (index & 1) != 0;
@@ -39,7 +66,7 @@ int main(int argc, char** argv)
     if (!batch.dispatched) {
         std::cerr << "Requested GPU backend unavailable: " << batch.diagnostic << '\n'
                   << VulkanSlicerBackend::runtime_diagnostic_report() << '\n';
-        return 77;
+        return 3;
     }
     if (!validate_vertical_batch(requests, batch))
         return 3;

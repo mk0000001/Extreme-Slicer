@@ -1,6 +1,8 @@
 #include "VulkanSlicer.hpp"
 #include "CudaSlicer.hpp"
 #include "GpuBatchSafety.hpp"
+#include "GpuShaderLoader.hpp"
+#include "GpuContextLifecycle.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -16,7 +18,7 @@
 #include <utility>
 
 #ifdef SLIC3R_ENABLE_VULKAN_SLICER
-#include <vulkan/vulkan.h>
+#include "GpuVulkanSynchronization.hpp"
 #endif
 
 namespace Slic3r::Gpu {
@@ -317,15 +319,8 @@ std::vector<uint32_t> load_intersection_shader(uint32_t workgroup_size)
     paths.emplace_back(std::string(SLIC3R_VULKAN_BUILD_SHADER_DIR) + "/" + filename);
 #endif
     for (const std::string& path : paths) {
-        std::ifstream stream(path, std::ios::binary | std::ios::ate);
-        if (!stream)
-            continue;
-        const std::streamsize byte_count = stream.tellg();
-        if (byte_count <= 0 || (byte_count % std::streamsize(sizeof(uint32_t))) != 0)
-            continue;
-        std::vector<uint32_t> words(size_t(byte_count) / sizeof(uint32_t));
-        stream.seekg(0);
-        if (stream.read(reinterpret_cast<char*>(words.data()), byte_count))
+        auto words = read_shader_words(path);
+        if (!words.empty())
             return words;
     }
     return {};
@@ -342,15 +337,8 @@ std::vector<uint32_t> load_tree_contour_shader()
     paths.emplace_back(std::string(SLIC3R_VULKAN_BUILD_SHADER_DIR) + "/" + filename);
 #endif
     for (const std::string& path : paths) {
-        std::ifstream stream(path, std::ios::binary | std::ios::ate);
-        if (!stream)
-            continue;
-        const std::streamsize byte_count = stream.tellg();
-        if (byte_count <= 0 || (byte_count % std::streamsize(sizeof(uint32_t))) != 0)
-            continue;
-        std::vector<uint32_t> words(size_t(byte_count) / sizeof(uint32_t));
-        stream.seekg(0);
-        if (stream.read(reinterpret_cast<char*>(words.data()), byte_count))
+        auto words = read_shader_words(path);
+        if (!words.empty())
             return words;
     }
     return {};
@@ -400,7 +388,7 @@ public:
                 batch.diagnostic = m_diagnostic;
                 return batch;
             }
-            std::lock_guard<std::mutex> lock(m_dispatch_mutex);
+            auto lock = m_lifecycle.acquire();
             return dispatch_locked(requests);
         });
     }
@@ -420,21 +408,21 @@ public:
                 batch.diagnostic = m_diagnostic;
                 return batch;
             }
-            std::lock_guard<std::mutex> lock(m_dispatch_mutex);
+            auto lock = m_lifecycle.acquire();
             return dispatch_tree_contours_locked(requests, contour_boxes);
         });
     }
 
     bool prepare_for_slicing()
     {
-        std::call_once(m_initialize_once, [this] {
+        m_lifecycle.initialize_once([this] {
             {
                 std::lock_guard<std::mutex> lock(g_shader_directory_mutex);
                 g_shader_directory_locked = true;
             }
             this->initialize();
         });
-        std::lock_guard<std::mutex> lock(m_dispatch_mutex);
+        auto lock = m_lifecycle.acquire();
         refresh_intersection_dispatch_mode();
         if (!m_ready) {
             if (m_diagnostic.empty())
@@ -448,6 +436,7 @@ public:
 
     bool should_dispatch_vertical_intersections(size_t request_count) const
     {
+        auto lock = m_lifecycle.acquire();
         return request_count >= (m_ready ? m_preferred_intersection_batch.load(std::memory_order_acquire)
                                          : kDefaultPreferredIntersectionBatch);
     }
@@ -458,9 +447,9 @@ public:
         // this safe if a future caller releases memory after an asynchronous
         // submission. The pipeline stays resident; only host-visible request
         // and result buffers are returned to the Vulkan allocator.
+        auto lock = m_lifecycle.acquire();
         if (!m_ready || m_device == VK_NULL_HANDLE)
             return;
-        std::lock_guard<std::mutex> lock(m_dispatch_mutex);
         if (m_staging_request_capacity == 0 && m_tree_request_capacity == 0)
             return;
         if (vkDeviceWaitIdle(m_device) != VK_SUCCESS)
@@ -1188,7 +1177,7 @@ private:
         vkCmdBindDescriptorSets(m_tree_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 m_tree_pipeline_layout, 0, 1, &m_tree_descriptor_set, 0, nullptr);
         vkCmdDispatch(m_tree_command_buffer, uint32_t(requests.size()), 1, 1);
-        if (vkEndCommandBuffer(m_tree_command_buffer) != VK_SUCCESS)
+        if (end_compute_readback(m_tree_command_buffer, vkCmdPipelineBarrier, vkEndCommandBuffer) != VK_SUCCESS)
             return fail("Vulkan could not end the tree contour command buffer.");
         const VkSubmitInfo submit_info {
             VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_tree_command_buffer, 0, nullptr };
@@ -1265,7 +1254,7 @@ private:
         vkCmdDispatch(m_command_buffer, uint32_t((requests.size() + m_workgroup_size - 1) / m_workgroup_size), 1, 1);
         if (m_compute_timestamps_available)
             vkCmdWriteTimestamp(m_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, m_timestamp_query_pool, 1);
-        if (vkEndCommandBuffer(m_command_buffer) != VK_SUCCESS)
+        if (end_compute_readback(m_command_buffer, vkCmdPipelineBarrier, vkEndCommandBuffer) != VK_SUCCESS)
             return fail("Vulkan could not end the reusable infill command buffer.");
         const VkSubmitInfo submit_info { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_command_buffer, 0, nullptr };
         if (vkResetFences(m_device, 1, &m_dispatch_fence) != VK_SUCCESS ||
@@ -1292,8 +1281,7 @@ private:
         return finish();
     }
 
-    std::once_flag m_initialize_once;
-    std::mutex     m_dispatch_mutex;
+    ContextLifecycle m_lifecycle;
     VkInstance     m_instance { VK_NULL_HANDLE };
     VkPhysicalDevice m_physical_device { VK_NULL_HANDLE };
     VkDevice       m_device { VK_NULL_HANDLE };
@@ -1485,29 +1473,17 @@ VulkanVerticalIntersectionBatch VulkanSlicerBackend::dispatch_vertical_intersect
         batch.diagnostic = "CPU-only compute mode is active.";
         return batch;
     }
-    if (!preflight_vertical_batch(requests)) {
-        batch.diagnostic = "Unsafe GPU arithmetic or batch contract; retain CPU geometry.";
-        return batch;
-    }
-
-    // CUDA is the preferred path.  The CUDA backend is optional at build time;
-    // a missing toolkit/device is a normal condition and falls through to
-    // Vulkan when that backend is enabled.
+    // Each backend gate validates inputs before touching its runtime. Avoid a
+    // capability query here: even malformed input and oversized batches must
+    // retain CPU geometry without initializing a CUDA context.
     if ((preference == ComputeBackendPreference::Cuda || preference == ComputeBackendPreference::Auto) && cuda_enabled()) {
-        const CudaSlicerCapabilities cuda = CudaSlicerBackend::query_capabilities();
-        if (cuda.runtime_available) {
-            VulkanVerticalIntersectionBatch cuda_batch =
-                CudaSlicerBackend::dispatch_vertical_intersections(requests);
-            if (cuda_batch.dispatched) {
-                runtime_stats_registry().set_compute_selection(
-                    "CUDA", true, false);
-                runtime_stats_registry().record_dispatch(requests.size(), cuda_batch);
-                return cuda_batch;
-            }
-            batch.diagnostic = cuda_batch.diagnostic;
-        } else {
-            batch.diagnostic = cuda.diagnostic;
+        VulkanVerticalIntersectionBatch cuda_batch = CudaSlicerBackend::dispatch_vertical_intersections(requests);
+        if (cuda_batch.dispatched) {
+            runtime_stats_registry().set_compute_selection("CUDA", true, false);
+            runtime_stats_registry().record_dispatch(requests.size(), cuda_batch);
+            return cuda_batch;
         }
+        batch.diagnostic = cuda_batch.diagnostic;
     }
 
 #ifdef SLIC3R_ENABLE_VULKAN_SLICER

@@ -1,4 +1,5 @@
 #include "CudaSlicer.hpp"
+#include "VulkanSlicer.hpp"
 #include "GpuBatchSafety.hpp"
 
 #include <chrono>
@@ -9,8 +10,8 @@ namespace Slic3r::Gpu {
 extern bool cuda_runtime_query(CudaSlicerCapabilities& capabilities);
 extern bool cuda_runtime_prepare(std::string& diagnostic);
 extern bool cuda_runtime_dispatch(
-    const std::vector<VulkanVerticalIntersectionRequest>& requests,
-    std::vector<VulkanVerticalIntersection>& intersections,
+    const std::vector<VerticalIntersectionRequest>& requests,
+    std::vector<VerticalIntersection>& intersections,
     double& gpu_elapsed_ms,
     std::string& diagnostic);
 extern void cuda_runtime_release();
@@ -52,15 +53,15 @@ bool CudaSlicerBackend::prepare_for_slicing()
 #endif
 }
 
-VulkanVerticalIntersectionBatch CudaSlicerBackend::dispatch_vertical_intersections(
-    const std::vector<VulkanVerticalIntersectionRequest>& requests)
+VerticalIntersectionBatch CudaSlicerBackend::dispatch_vertical_intersections(
+    const std::vector<VerticalIntersectionRequest>& requests)
 {
-    VulkanVerticalIntersectionBatch batch;
+    VerticalIntersectionBatch batch;
 #ifdef SLIC3R_ENABLE_CUDA_SLICER
     batch = dispatch_checked_vertical_batch(requests, cuda_safety_state(),
         VulkanSlicerBackend::cuda_enabled() &&
         VulkanSlicerBackend::backend_preference() != ComputeBackendPreference::Cpu, [&] {
-        VulkanVerticalIntersectionBatch result;
+        VerticalIntersectionBatch result;
         const auto host_start = std::chrono::steady_clock::now();
         result.dispatched = cuda_runtime_dispatch(requests, result.intersections,
                                                    result.gpu_elapsed_ms, result.diagnostic);

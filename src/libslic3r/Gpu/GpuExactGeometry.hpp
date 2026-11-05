@@ -17,6 +17,8 @@ namespace Slic3r::Gpu {
 using Coord = int64_t;
 using WideCoord = boost::multiprecision::int256_t;
 
+// Legacy tile helpers are not the production dispatch contract; callers use
+// their own current application coordinate scale and checked raw coordinates.
 constexpr Coord coordinate_scale = 1'000'000; // one million fixed-point units per millimetre.
 constexpr Coord max_tile_radius = 2'000'000;  // 2 mm from a tile origin.
 

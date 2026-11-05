@@ -73,8 +73,8 @@ bool query_locked(CudaSlicerCapabilities& capabilities)
     return true;
 }
 
-bool dispatch_locked(const std::vector<VulkanVerticalIntersectionRequest>& requests,
-                     std::vector<VulkanVerticalIntersection>& intersections,
+bool dispatch_locked(const std::vector<VerticalIntersectionRequest>& requests,
+                     std::vector<VerticalIntersection>& intersections,
                      double& elapsed_ms, std::string& diagnostic)
 {
     intersections.clear();
@@ -151,7 +151,7 @@ bool prepare_locked(std::string& diagnostic)
     g_maximum_grid_x = uint32_t(properties.maxGridSize[0]);
     // Qualify reversed edges, signs and translated coordinates before any
     // live output is accepted. The same wide oracle validates the entire set.
-    std::vector<VulkanVerticalIntersectionRequest> requests;
+    std::vector<VerticalIntersectionRequest> requests;
     for (uint64_t index = 0; index < 2048; ++index) {
         const Coord left = -500'000 + Coord(index % 97) * 101;
         const Coord right = left + 1003 + Coord(index % 89);
@@ -160,7 +160,7 @@ bool prepare_locked(std::string& diagnostic)
                              {reverse ? left : right, 950'000 - Coord(index) * 53}},
                             left + 1 + Coord(index % uint64_t(right - left - 1)), index});
     }
-    VulkanVerticalIntersectionBatch qualification;
+    VerticalIntersectionBatch qualification;
     qualification.dispatched = dispatch_locked(requests, qualification.intersections, qualification.gpu_elapsed_ms, diagnostic);
     if (!validate_vertical_batch(requests, qualification)) {
         diagnostic = "CUDA complete exact-integer qualification failed: " + diagnostic;
@@ -185,8 +185,8 @@ bool cuda_runtime_prepare(std::string& diagnostic)
     return prepare_locked(diagnostic);
 }
 
-bool cuda_runtime_dispatch(const std::vector<VulkanVerticalIntersectionRequest>& requests,
-                           std::vector<VulkanVerticalIntersection>& intersections,
+bool cuda_runtime_dispatch(const std::vector<VerticalIntersectionRequest>& requests,
+                           std::vector<VerticalIntersection>& intersections,
                            double& elapsed_ms, std::string& diagnostic)
 {
     // Check before selecting a device or constructing a runtime context.

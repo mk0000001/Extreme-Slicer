@@ -45,8 +45,8 @@ jobs:
       - name: Fetch verified Boost headers
         shell: pwsh
         run: |
-          Invoke-WebRequest 'https://github.com/boostorg/boost/releases/download/boost-1.84.0/boost-1.84.0.tar.gz' -OutFile boost-source.tar.gz
-          if ((Get-FileHash boost-source.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant() -ne '4d27e9efed0f6f152dc28db6430b9d3dfb40c0345da7342eaa5a987dde57bd95') { throw 'Boost archive digest mismatch' }
+          Invoke-WebRequest 'https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz' -OutFile boost-source.tar.gz
+          if ((Get-FileHash boost-source.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'a5800f405508f5df8114558ca9855d2640a2de8f0445f051fa1c7c3383045724') { throw 'Boost archive digest mismatch' }
           tar -xzf boost-source.tar.gz
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $boost = (Get-ChildItem -Directory -Filter 'boost*' | Where-Object { Test-Path (Join-Path $_.FullName 'boost/version.hpp') } | Select-Object -First 1).FullName

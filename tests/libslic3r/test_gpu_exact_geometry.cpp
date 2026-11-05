@@ -4,12 +4,44 @@
 #include "libslic3r/Gpu/VulkanSlicer.hpp"
 #include "libslic3r/Gpu/GpuBatchSafety.hpp"
 #include "libslic3r/Gpu/CudaSlicer.hpp"
+#include "libslic3r/Gpu/GpuShaderLoader.hpp"
 
+#include "libslic3r/Gpu/GpuContextLifecycle.hpp"
+#include <future>
+#include <thread>
+#include <atomic>
 #include <limits>
 #include <stdexcept>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <chrono>
 
 using namespace Slic3r::Gpu;
+
+TEST_CASE("GPU shader files open from Unicode paths and reject malformed modules", "[Gpu][Geometry]")
+{
+    const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto path = std::filesystem::temp_directory_path() /
+        std::filesystem::u8path(std::string(u8"gpu_\uD55C\uAE00_") + std::to_string(suffix) + ".spv");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code ignored; std::filesystem::remove(path, ignored); }
+    } cleanup {path};
+    const std::vector<uint32_t> words {0x07230203, 0x00010000, 0, 1, 0};
+    {
+        std::ofstream stream(path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * sizeof(uint32_t)));
+    }
+    REQUIRE(read_shader_words(path.u8string()) == words);
+    {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        stream << "bad";
+    }
+    REQUIRE(read_shader_words(path.u8string()).empty());
+    REQUIRE(read_shader_words(path.u8string() + ".missing").empty());
+}
 
 class ScopedBackendEnvironment {
 public:
@@ -53,6 +85,20 @@ TEST_CASE("Explicit CPU environment overrides enabled GPU preferences", "[Gpu][G
     REQUIRE_FALSE(cuda);
     REQUIRE_FALSE(vulkan);
     REQUIRE_FALSE(VulkanSlicerBackend::prepare_for_slicing());
+}
+
+TEST_CASE("Backend environment selects explicit CUDA Vulkan auto and rejects unknown values", "[Gpu][Geometry]")
+{
+    const std::vector<std::pair<const char*, ComputeBackendPreference>> choices {
+        {"cuda", ComputeBackendPreference::Cuda}, {"vulkan", ComputeBackendPreference::Vulkan},
+        {"auto", ComputeBackendPreference::Auto}, {"unknown", ComputeBackendPreference::Cpu}
+    };
+    for (const auto& choice : choices) {
+        DYNAMIC_SECTION("backend " << choice.first) {
+            ScopedBackendEnvironment environment(choice.first);
+            REQUIRE(VulkanSlicerBackend::backend_preference() == choice.second);
+        }
+    }
 }
 
 static VulkanVerticalIntersectionRequest safe_request(uint64_t id = 0)
@@ -233,6 +279,44 @@ TEST_CASE("Tree batch acceptance never consumes an incorrect negative", "[Gpu][G
     REQUIRE(state.quarantined());
 }
 
+TEST_CASE("Tree gate rejects malformed output and bounds pair work before dispatch", "[Gpu][Geometry]")
+{
+    const std::vector<VulkanTreeContourRequest> requests {{{{10, 10}, {20, 10}}, 0}};
+    const std::vector<Segment> boxes {{{0, 0}, {100, 100}}};
+    for (int damage = 0; damage < 3; ++damage) {
+        DYNAMIC_SECTION("tree malformed " << damage) {
+            BackendSafetyState state;
+            const auto result = dispatch_checked_tree_batch(requests, boxes, state, true, [&] {
+                VulkanTreeContourBatch batch;
+                batch.dispatched = damage != 0;
+                if (damage != 1) batch.may_intersect = {2};
+                return batch;
+            });
+            REQUIRE_FALSE(result.dispatched);
+            REQUIRE(result.may_intersect.empty());
+            REQUIRE(state.quarantined());
+        }
+    }
+    BackendSafetyState state;
+    bool invoked = false;
+    std::vector<VulkanTreeContourRequest> many(4097, requests.front());
+    std::vector<Segment> many_boxes(4096, boxes.front());
+    const auto result = dispatch_checked_tree_batch(many, many_boxes, state, true, [&] {
+        invoked = true;
+        return VulkanTreeContourBatch{};
+    });
+    REQUIRE_FALSE(result.dispatched);
+    REQUIRE_FALSE(invoked);
+    REQUIRE_FALSE(state.quarantined());
+    auto candidate = dispatch_checked_tree_batch(requests, boxes, state, true, [] {
+        VulkanTreeContourBatch batch;
+        batch.dispatched = true;
+        batch.may_intersect = {1};
+        return batch;
+    });
+    REQUIRE(candidate.dispatched);
+}
+
 TEST_CASE("GPU defaults preserve CPU geometry without initialization", "[Gpu][Geometry]")
 {
     REQUIRE_FALSE(VulkanSlicerBackend::compute_enabled());
@@ -294,4 +378,31 @@ TEST_CASE("GPU deterministic geometry requires a compute queue and int64 shaders
     REQUIRE_FALSE(VulkanSlicerBackend::supports_deterministic_geometry(device));
     device.shader_int64 = true;
     REQUIRE(VulkanSlicerBackend::supports_deterministic_geometry(device));
+}
+
+TEST_CASE("Staging cleanup waits for complete GPU qualification", "[Gpu][Concurrency]")
+{
+    ContextLifecycle lifecycle;
+    std::promise<void> entered, resume, cleanup_started;
+    auto release = resume.get_future().share();
+    std::atomic<bool> qualified {false};
+    std::thread init([&] { lifecycle.initialize_once([&] {
+        entered.set_value(); release.wait(); qualified.store(true);
+    }); });
+    entered.get_future().wait();
+    auto cleanup = std::async(std::launch::async, [&] {
+        cleanup_started.set_value();
+        auto lock = lifecycle.acquire();
+        return qualified.load();
+    });
+    cleanup_started.get_future().wait();
+    const auto blocked = cleanup.wait_for(std::chrono::milliseconds(100));
+    resume.set_value();
+    init.join();
+    const bool observed_qualification = cleanup.get();
+    REQUIRE(blocked == std::future_status::timeout);
+    REQUIRE(observed_qualification);
+    int calls = 0;
+    lifecycle.initialize_once([&] { ++calls; });
+    REQUIRE(calls == 0);
 }
