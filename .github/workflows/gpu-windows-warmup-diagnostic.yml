@@ -1,0 +1,90 @@
+name: Windows CUDA entry warmup diagnostic build
+on:
+  push:
+    branches: [ci/gpu-windows-warmup-diagnostic]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  helper:
+    if: github.repository == 'mk0000001/Extreme-Slicer'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ssrobins/install-cmake@v1
+        with:
+          version: 3.31.6
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+      - name: Verify source and download header-only Boost
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory warmup-evidence -Force | Out-Null
+          git merge-base --is-ancestor de4488ad1806d72462c58ebf5f56fcdc8bea5174 HEAD
+          if ($LASTEXITCODE) { throw 'Unexpected source ancestry' }
+          $expectedBlob = '14295b27c38870e6f4ed41b4e7433d2784845424'
+          if ((git rev-parse 'de4488ad1806d72462c58ebf5f56fcdc8bea5174:src/OrcaSlicer_app_msvc.cpp').Trim() -ne $expectedBlob) { throw 'Source blob mismatch' }
+          if ((git hash-object diagnostics/windows-cuda-warmup/OrcaSlicer_app_msvc.original.cpp).Trim() -ne $expectedBlob) { throw 'Pristine source copy mismatch' }
+          Invoke-WebRequest 'https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz' -OutFile boost-source.tar.gz
+          if ((Get-FileHash boost-source.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'a5800f405508f5df8114558ca9855d2640a2de8f0445f051fa1c7c3383045724') { throw 'Boost source digest mismatch' }
+          tar -xzf boost-source.tar.gz
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --version | Tee-Object warmup-evidence/cmake-version.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          msbuild -version | Tee-Object warmup-evidence/msbuild-version.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build only the diagnostic wrapper
+        shell: pwsh
+        run: |
+          cmake -S diagnostics/windows-cuda-warmup -B build-warmup -G 'Visual Studio 17 2022' -A x64 -T v143 "-DBOOST_HEADER_DIR=$pwd/boost_1_84_0" *> warmup-evidence/configure.log
+          $code = $LASTEXITCODE
+          Get-Content warmup-evidence/configure.log -Tail 80
+          if ($code) { exit $code }
+          cmake --build build-warmup --config Release --parallel 2 *> warmup-evidence/build.log
+          $code = $LASTEXITCODE
+          Get-Content warmup-evidence/build.log -Tail 80
+          if ($code) { exit $code }
+      - name: Package diagnostic and complete source provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory warmup-package/source,warmup-package/licenses -Force | Out-Null
+          Copy-Item build-warmup/Release/orca-cuda-entry-diagnostic.exe warmup-package/
+          if (Test-Path build-warmup/Release/orca-cuda-entry-diagnostic.pdb) { Copy-Item build-warmup/Release/orca-cuda-entry-diagnostic.pdb warmup-package/ }
+          Copy-Item diagnostics/windows-cuda-warmup/* warmup-package/source/
+          Copy-Item .github/workflows/gpu-windows-warmup-diagnostic.yml warmup-package/source/
+          Copy-Item LICENSE warmup-package/licenses/AGPL-3.0.txt
+          Copy-Item boost_1_84_0/LICENSE_1_0.txt warmup-package/licenses/Boost-1.0.txt
+          Copy-Item build-warmup/CMakeCache.txt warmup-evidence/
+          Copy-Item build-warmup/CMakeFiles/3.31.6/CMakeCXXCompiler.cmake warmup-evidence/
+          git diff --no-index -- diagnostics/windows-cuda-warmup/OrcaSlicer_app_msvc.original.cpp diagnostics/windows-cuda-warmup/OrcaSlicer_cuda_warmup_diagnostic.cpp > warmup-package/source/diagnostic-wrapper.patch
+          if ($LASTEXITCODE -ne 1) { throw 'Expected one diagnostic patch' }
+          $global:LASTEXITCODE = 0
+          $source = (git rev-parse HEAD).Trim()
+          @("ci_commit=$source", 'base_commit=de4488ad1806d72462c58ebf5f56fcdc8bea5174', 'original_path=src/OrcaSlicer_app_msvc.cpp', 'original_blob=14295b27c38870e6f4ed41b4e7433d2784845424', "source_url=https://github.com/$env:GITHUB_REPOSITORY/tree/$source", "run_id=$env:GITHUB_RUN_ID", 'configuration=Release', 'generator=Visual Studio 17 2022', 'toolset=v143', 'defines=SLIC3R_GUI=1;SLIC3R_WRAPPER_NOCONSOLE=1;UNICODE;_UNICODE', 'diagnostic_only=true', 'executed_in_ci=false') | Set-Content warmup-package/PROVENANCE.txt
+          Copy-Item warmup-evidence/* warmup-package/source/
+          $manifest = @(Get-ChildItem warmup-package -Recurse -File | Sort-Object FullName | ForEach-Object { "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $([IO.Path]::GetRelativePath((Join-Path $pwd 'warmup-package'), $_.FullName).Replace('\','/'))" })
+          $manifest | Set-Content warmup-package/SHA256SUMS.txt -Encoding ascii
+          Compress-Archive warmup-package/* windows-cuda-warmup-diagnostic.zip
+          "$((Get-FileHash windows-cuda-warmup-diagnostic.zip -Algorithm SHA256).Hash.ToLowerInvariant())  windows-cuda-warmup-diagnostic.zip" | Set-Content windows-cuda-warmup-diagnostic.sha256 -Encoding ascii
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-cuda-warmup-diagnostic
+          path: |
+            windows-cuda-warmup-diagnostic.zip
+            windows-cuda-warmup-diagnostic.sha256
+          if-no-files-found: error
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-cuda-warmup-build-evidence
+          path: warmup-evidence/
+          if-no-files-found: error
