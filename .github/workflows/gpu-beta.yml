@@ -1,0 +1,55 @@
+name: GPU beta validation
+
+on:
+  push:
+    branches: [ci/gpu-beta-2.5]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: '2'
+
+jobs:
+  windows-dependencies:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: false
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+      - uses: ssrobins/install-cmake@v1
+        with:
+          version: 3.31.6
+      - name: Install build utilities
+        run: choco install strawberryperl pkgconfiglite --yes --no-progress
+      - name: Cache exact Orca RC dependencies
+        id: deps
+        uses: actions/cache@v6
+        with:
+          path: deps/build/OrcaSlicer_dep
+          key: gpu-beta-orca250rc-windows2022-vs17-release-${{ hashFiles('deps/**') }}
+      - name: Build from this Orca dependency manifest
+        if: steps.deps.outputs.cache-hit != 'true'
+        shell: cmd
+        run: build_win.bat -d --arch x64 --vs 2022 --msvc --msbuild --deps-dir deps/build -j 2
+      - name: Record source provenance
+        shell: pwsh
+        run: |
+          git rev-parse HEAD | Set-Content dependency-source.txt
+          git rev-parse HEAD:deps | Add-Content dependency-source.txt
+          cmake --version | Add-Content dependency-source.txt
+      - name: Package dependency prefix
+        shell: pwsh
+        run: Compress-Archive -Path deps/build/OrcaSlicer_dep -DestinationPath Orca-2.5-rc-Windows-deps.zip
+      - uses: actions/upload-artifact@v6
+        with:
+          name: orca250rc-windows-dependencies
+          path: |
+            Orca-2.5-rc-Windows-deps.zip
+            dependency-source.txt
+          retention-days: 14
