@@ -1,0 +1,145 @@
+name: Orca frozen CPU Arachne required clang-tidy
+
+on:
+  push:
+    branches: [ci/arachne-cpu-lint-20261106]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SLIC3R_GPU_BACKEND: cpu
+  ORCA_LINT_BASE: 637d7a9ce6e2cda62cc32f86bd7d730ea0f8219f
+  ORCA_PRODUCT_COMMIT: 5a6339c16b7c7dc338bed174844ce181fd292832
+
+jobs:
+  windows-clang-tidy:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: ssrobins/install-cmake@v1
+        with:
+          version: 3.31.6
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+      - name: Record exact source and normal execution policy
+        run: |
+          New-Item -ItemType Directory lint-evidence -Force | Out-Null
+          $log = 'lint-evidence/source-and-policy.log'
+          try {
+            & {
+              git cat-file -e "$($env:ORCA_LINT_BASE)^{commit}"
+              if ($LASTEXITCODE) { throw 'Frozen CPU comparison base is unavailable despite full-history checkout' }
+              git merge-base --is-ancestor $env:ORCA_PRODUCT_COMMIT HEAD
+              if ($LASTEXITCODE) { throw 'Expected current product source is not an ancestor of this workflow revision' }
+              if ((git rev-parse HEAD^).Trim() -ne $env:ORCA_PRODUCT_COMMIT) { throw 'Lint revision must directly parent the frozen CPU source' }
+              $workflowOnly = @(git diff --name-only $env:ORCA_PRODUCT_COMMIT HEAD)
+              if ($LASTEXITCODE -or $workflowOnly.Count -ne 1 -or $workflowOnly[0] -ne '.github/workflows/cpu-arachne-lint.yml') { throw 'Lint child contains changes beyond its dedicated workflow' }
+              $expected = @('src/libslic3r/Arachne/utils/ExtrusionLine.cpp','src/libslic3r/Arachne/utils/ExtrusionLine.hpp','src/libslic3r/PerimeterGenerator.cpp','tests/libslic3r/CMakeLists.txt','tests/libslic3r/test_arachne_extrusion_clipping.cpp')
+              $actual = @(git diff --name-only $env:ORCA_LINT_BASE HEAD -- src tests)
+              if ($LASTEXITCODE -or @(Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)).Count) { throw 'Frozen five-file CPU change scope differs' }
+              Get-FileHash -LiteralPath $expected -Algorithm SHA256 | Format-List
+              git rev-parse HEAD
+              git rev-parse HEAD:deps
+              git diff --name-status $env:ORCA_LINT_BASE HEAD
+              Get-ExecutionPolicy -List | Format-Table
+              Get-FileHash scripts/run_clang_tidy.ps1,scripts/clang_tidy_diff.py,scripts/clang_tidy_requirements.txt,.clang-tidy -Algorithm SHA256 | Format-List
+            } *> $log
+          } finally { if (Test-Path $log) { Get-Content $log -Tail 45 } }
+      - name: Download ready exact-manifest dependencies
+        uses: actions/download-artifact@v6
+        with:
+          artifact-ids: '13400603631'
+          repository: mk0000001/Extreme-Slicer
+          run-id: '41989249878'
+          github-token: ${{ github.token }}
+          path: upstream-deps
+      - name: Verify provenance and restore the dependency prefix
+        id: deps
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $log = 'lint-evidence/dependencies.log'
+          try {
+            & {
+              $expectedTree = 'b918997223ff1f95c70218965e0f06aa111cbeab'
+              if ((git rev-parse HEAD:deps).Trim() -ne $expectedTree) { throw 'Dependency manifest differs from the ready artifact' }
+              $archive = @(Get-ChildItem upstream-deps -Recurse -File -Filter 'Orca-2.5-rc-Windows-deps.zip')
+              $provenanceFile = @(Get-ChildItem upstream-deps -Recurse -File -Filter 'dependency-source.txt')
+              if ($archive.Count -ne 1 -or $provenanceFile.Count -ne 1) { throw 'Expected one dependency archive and provenance file' }
+              $digest = (Get-FileHash -LiteralPath $archive[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($digest -ne '28d52165a0438d376cb3b9fe7233c6249db90cdc7859bb8654e13a3f39ab6590') { throw 'Dependency archive digest mismatch' }
+              $provenance = @((Get-Content -LiteralPath $provenanceFile[0].FullName -Raw) -split '[\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+              if ($provenance.Count -lt 3 -or $provenance[0] -ne '16c699c156ffb7fd35f2bdb3c086b6c6d875c9f7' -or $provenance[1] -ne $expectedTree -or $provenance[2] -ne 'cmake version 3.31.6') { throw 'Dependency provenance mismatch' }
+              "$digest  $($archive[0].Name)"
+              $provenance
+              Copy-Item -LiteralPath $provenanceFile[0].FullName -Destination lint-evidence/dependency-source.txt
+              New-Item -ItemType Directory deps/build -Force | Out-Null
+              Expand-Archive -LiteralPath $archive[0].FullName -DestinationPath deps/build
+              foreach ($required in @('lib','include','libpython/python.exe','libpython/libs/python312.lib')) {
+                if (-not (Test-Path (Join-Path 'deps/build/OrcaSlicer_dep/usr/local' $required))) { throw "Missing prebuilt dependency content: $required" }
+              }
+            } *> $log
+          } finally { if (Test-Path $log) { Get-Content $log -Tail 30 } }
+      - name: Run the original required PowerShell check
+        id: product-lint
+        run: |
+          # Invoke normally in a child process so its exit is captured verbatim.
+          # A policy rejection remains a failure; this workflow does not bypass it.
+          Remove-Item Env:CLANG_TIDY -ErrorAction SilentlyContinue
+          $log = 'lint-evidence/original-script.log'
+          $ErrorActionPreference = 'Continue'
+          & pwsh -NoProfile -NonInteractive -File scripts/run_clang_tidy.ps1 -Base $env:ORCA_LINT_BASE -NoFetch -DepsDir deps/build -BuildDir build-tidy -Jobs 2 -Yes *> $log
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path $log) { Get-Content $log -Tail 70 }
+          Write-Host "Original required script exit code: $code (full output in $log)"
+          exit $code
+      - name: Prove all changed CPU sources entered the real lint database
+        if: ${{ always() && steps.product-lint.outcome == 'success' }}
+        run: |
+          $log = 'lint-evidence/cpu-coverage.log'
+          try {
+            & {
+              $database = Get-Content build-tidy/compile_commands.json -Raw | ConvertFrom-Json
+              $expectedSources = @('src/libslic3r/Arachne/utils/ExtrusionLine.cpp','src/libslic3r/PerimeterGenerator.cpp','tests/libslic3r/test_arachne_extrusion_clipping.cpp')
+              foreach ($path in $expectedSources) {
+                $entries = @($database | Where-Object { $file = $_.file.Replace('\','/'); $file -eq $path -or $file.EndsWith('/' + $path, [StringComparison]::OrdinalIgnoreCase) })
+                if (-not $entries.Count) { throw "Real configured database omitted changed CPU source $path" }
+                $entries | ConvertTo-Json -Depth 8
+              }
+              $output = Get-Content lint-evidence/original-script.log -Raw
+              if ($output -notmatch '(?m)^Checking 3 file\(s\) with ') { throw 'Original script did not report checking all three actionable C++ files (two sources and standalone header)' }
+              if ($output -match '(?m)^Skipping ') { throw 'Original required check skipped a changed source' }
+              'All three changed sources are in the real generated database. Original helper checked the three actionable C++ files; PerimeterGenerator.cpp deletes the moved helper and has no added lines or removed includes under the unchanged official policy. The fifth product change is the configured CMake test registration.'
+            } *> $log
+          } finally { if (Test-Path $log) { Get-Content $log -Tail 45 } }
+      - name: Upload complete lint evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: orca-cpu-arachne-required-lint-evidence
+          path: |
+            lint-evidence/
+            build-tidy/configure.log
+            build-tidy/git_commit_hash.log
+            build-tidy/CMakeCache.txt
+            build-tidy/compile_commands.json
+            build-tidy/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
