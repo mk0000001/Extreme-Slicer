@@ -10,8 +10,13 @@
 #include <cmath>
 #include <cctype>
 #include <cstdlib>
+#include <cstddef>
+#include <cstdint>
+#include <string>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
+#include <locale>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -46,9 +51,13 @@ std::mutex g_shader_directory_mutex;
 std::string g_shader_directory;
 bool g_shader_directory_locked { false };
 
+void enable_requested_exit_diagnostics(const char* backend);
+
 const char* runtime_backend_environment()
 {
-    return std::getenv("SLIC3R_GPU_BACKEND");
+    const char* backend = std::getenv("SLIC3R_GPU_BACKEND");
+    enable_requested_exit_diagnostics(backend);
+    return backend;
 }
 
 std::string shader_directory()
@@ -60,6 +69,36 @@ std::string shader_directory()
     return directory ? directory : "";
 }
 
+
+std::string backend_name(ComputeBackendPreference preference)
+{
+    switch (preference) {
+    case ComputeBackendPreference::Cuda: return "cuda";
+    case ComputeBackendPreference::Vulkan: return "vulkan";
+    case ComputeBackendPreference::Auto: return "auto";
+    default: return "cpu";
+    }
+}
+
+struct ExitDiagnosticsSnapshot {
+    std::filesystem::path destination;
+    std::string active_backend;
+    std::string device;
+    std::string backend_reason;
+    std::string environment_backend {"unset"};
+    std::string requested_backend {"cpu"};
+    uint64_t vertical_submitted {0};
+    uint64_t vertical_accepted {0};
+    uint64_t vertical_full_checks {0};
+    uint64_t vertical_failures {0};
+    uint64_t queue_submissions {0};
+    uint64_t tree_submissions {0};
+    uint64_t tree_submitted_branches {0};
+    uint64_t tree_contour_boxes {0};
+    uint64_t tree_validated_branches {0};
+    uint64_t tree_negative_branches {0};
+    uint64_t tree_failures {0};
+};
 
 class RuntimeStatsRegistry {
 public:
@@ -123,6 +162,9 @@ public:
         ++m_stats.dispatch_calls;
         m_stats.queue_submissions += batch.queue_submissions;
         m_stats.submitted_intersections += request_count;
+        m_exit.queue_submissions += batch.queue_submissions;
+        if (batch.queue_submissions != 0)
+            m_exit.vertical_submitted += request_count;
         m_stats.last_gpu_ms = batch.gpu_elapsed_ms;
         m_stats.last_host_ms = batch.host_elapsed_ms;
         if (batch.gpu_elapsed_ms >= 0.0)
@@ -150,20 +192,77 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         m_stats.accepted_gpu_intersections += accepted_gpu_results;
         m_stats.cpu_validation_checks += cpu_validation_checks;
-        if (validation_failed)
+        m_exit.vertical_accepted += accepted_gpu_results;
+        m_exit.vertical_full_checks += cpu_validation_checks;
+        if (validation_failed) {
             ++m_stats.validation_failures;
+            ++m_exit.vertical_failures;
+        }
         m_stats.last_diagnostic = diagnostic;
     }
 
-    void record_tree_contour_broad_phase(size_t request_count, size_t edge_count,
+    void record_tree_contour_broad_phase(size_t request_count, size_t box_count,
                                          const std::string& diagnostic)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         ++m_stats.dispatch_calls;
         ++m_stats.queue_submissions;
+        ++m_exit.queue_submissions;
+        ++m_exit.tree_submissions;
+        m_exit.tree_submitted_branches += request_count;
+        m_exit.tree_contour_boxes += box_count;
         m_stats.current_operation = "GPU tree-support broad phase (CPU exact confirmation)";
         m_stats.last_diagnostic = diagnostic + " (" + std::to_string(request_count) +
-            " branches, " + std::to_string(edge_count) + " contour edges).";
+            " branches, " + std::to_string(box_count) + " whole contour boxes).";
+    }
+
+    void record_vertical_failure(const std::string& diagnostic)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_exit.vertical_failures;
+        m_stats.active_backend = "CPU";
+        m_stats.last_diagnostic = diagnostic;
+    }
+
+    void record_tree_result(size_t request_count, const VulkanTreeContourBatch& batch)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (batch.dispatched) {
+            m_exit.tree_validated_branches += request_count;
+            m_exit.tree_negative_branches += std::count(batch.may_intersect.begin(), batch.may_intersect.end(), uint8_t(0));
+            m_stats.active_backend = "Vulkan";
+        } else if (!batch.diagnostic.empty()) {
+            ++m_exit.tree_failures;
+            m_stats.active_backend = "CPU";
+            m_stats.last_diagnostic = batch.diagnostic;
+        }
+    }
+
+    void configure_exit_diagnostics(std::filesystem::path destination)
+    {
+        m_exit.destination = std::move(destination);
+        record_environment(std::getenv("SLIC3R_GPU_BACKEND"));
+    }
+
+    void record_environment(const char* backend)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const std::string mode = backend ? backend : "";
+        const bool known = mode == "cpu" || mode == "cuda" || mode == "vulkan" || mode == "auto";
+        m_exit.environment_backend = backend ? (known ? mode : "unknown") : "unset";
+        m_exit.requested_backend = backend ? (known ? mode : "cpu") : backend_name(g_backend_preference.load(std::memory_order_acquire));
+    }
+
+    ExitDiagnosticsSnapshot exit_snapshot() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ExitDiagnosticsSnapshot result = m_exit;
+        result.active_backend = m_stats.active_backend;
+        result.device = m_stats.selected_device;
+        result.backend_reason = m_stats.last_diagnostic;
+        if (result.environment_backend == "unset")
+            result.requested_backend = backend_name(g_backend_preference.load(std::memory_order_acquire));
+        return result;
     }
 
     VulkanSlicerRuntimeStats snapshot() const
@@ -179,6 +278,8 @@ private:
 
     mutable std::mutex          m_mutex;
     VulkanSlicerRuntimeStats    m_stats;
+    // Process totals intentionally survive begin_slice(), unlike public UI stats.
+    ExitDiagnosticsSnapshot     m_exit;
 };
 
 VulkanIntersectionValidationMode configured_validation_mode()
@@ -195,10 +296,105 @@ std::string RuntimeStatsRegistry::validation_mode_name()
         "sampled CPU reference after GPU qualification";
 }
 
+RuntimeStatsRegistry* g_exit_registry {nullptr};
+
+std::filesystem::path exit_diagnostics_destination()
+{
+#ifdef _WIN32
+    const wchar_t* value = _wgetenv(L"SLIC3R_GPU_DIAGNOSTICS");
+    return value && *value ? std::filesystem::path(value) : std::filesystem::path{};
+#else
+    const char* value = std::getenv("SLIC3R_GPU_DIAGNOSTICS");
+    return value && *value ? std::filesystem::u8path(value) : std::filesystem::path{};
+#endif
+}
+
+std::string diagnostic_line(std::string value)
+{
+    std::string line;
+    for (const char character : value) {
+        if (character == '\n') line += "\\n";
+        else if (character == '\r') line += "\\r";
+        else if (character == '\\') line += "\\\\";
+        else line += character;
+    }
+    return line;
+}
+
+void write_exit_diagnostics() noexcept
+{
+    // This pointer names the already constructed registry. Never call the
+    // registry factory, backend getters or any GPU API during process teardown.
+    try {
+        if (!g_exit_registry)
+            return;
+        const ExitDiagnosticsSnapshot snapshot = g_exit_registry->exit_snapshot();
+        std::ofstream output(snapshot.destination, std::ios::binary | std::ios::trunc);
+        if (!output)
+            return;
+        output.imbue(std::locale::classic());
+        output << "schema=1\n"
+               << "environment_backend=" << snapshot.environment_backend << '\n'
+               << "requested_backend=" << snapshot.requested_backend << '\n'
+               << "active_backend=" << (snapshot.active_backend.empty() ? "CPU" : snapshot.active_backend) << '\n'
+               << "vertical_submitted=" << snapshot.vertical_submitted << '\n'
+               << "vertical_accepted=" << snapshot.vertical_accepted << '\n'
+               << "vertical_full_checks=" << snapshot.vertical_full_checks << '\n'
+               << "vertical_failures=" << snapshot.vertical_failures << '\n'
+               << "queue_submissions=" << snapshot.queue_submissions << '\n'
+               << "tree_submissions=" << snapshot.tree_submissions << '\n'
+               << "tree_submitted_branches=" << snapshot.tree_submitted_branches << '\n'
+               << "tree_contour_boxes=" << snapshot.tree_contour_boxes << '\n'
+               << "tree_validated_branches=" << snapshot.tree_validated_branches << '\n'
+               << "tree_negative_branches=" << snapshot.tree_negative_branches << '\n'
+               << "tree_failures=" << snapshot.tree_failures << '\n'
+               << "device=" << diagnostic_line(snapshot.device) << '\n'
+               << "backend_reason=" << diagnostic_line(snapshot.backend_reason.empty() ?
+                      (snapshot.requested_backend == "cpu" ? "CPU mode selected; no GPU batch recorded." : "No GPU batch recorded.") :
+                      snapshot.backend_reason) << '\n';
+    } catch (...) {
+        // Optional observability must not change geometry or process exit status.
+    }
+}
+
 RuntimeStatsRegistry& runtime_stats_registry()
 {
     static RuntimeStatsRegistry registry;
+    // Register AFTER registry construction/destructor registration, so this
+    // callback runs first while the mutex, strings and destination still live.
+    static const bool registered = [&] {
+        try {
+            const auto destination = exit_diagnostics_destination();
+            if (destination.empty())
+                return false;
+            registry.configure_exit_diagnostics(destination);
+            g_exit_registry = &registry;
+            if (std::atexit(write_exit_diagnostics) == 0)
+                return true;
+            g_exit_registry = nullptr;
+        } catch (...) {
+            // Invalid paths/allocation failure cannot affect the slicing path.
+        }
+        return false;
+    }();
+    (void)registered;
     return registry;
+}
+
+void enable_requested_exit_diagnostics(const char* backend)
+{
+    static const bool requested = [] {
+#ifdef _WIN32
+        const wchar_t* value = _wgetenv(L"SLIC3R_GPU_DIAGNOSTICS");
+#else
+        const char* value = std::getenv("SLIC3R_GPU_DIAGNOSTICS");
+#endif
+        return value && *value;
+    }();
+    if (requested) {
+        try { runtime_stats_registry().record_environment(backend); }
+        catch (...) { /* Diagnostics cannot interrupt geometry work. */ }
+    }
 }
 
 bool is_gtx_1060(const std::string& name, uint32_t vendor_id)
@@ -402,7 +598,7 @@ public:
             requests.size() > maximum_tree_requests || contour_boxes.size() > maximum_tree_requests ||
             uint64_t(requests.size()) * contour_boxes.size() < minimum_pair_count)
             return {};
-        return dispatch_checked_tree_batch(requests, contour_boxes, vulkan_safety_state(), true, [&] {
+        auto batch = dispatch_checked_tree_batch(requests, contour_boxes, vulkan_safety_state(), true, [&] {
             VulkanTreeContourBatch batch;
             if (!prepare_for_slicing()) {
                 batch.diagnostic = m_diagnostic;
@@ -411,6 +607,8 @@ public:
             auto lock = m_lifecycle.acquire();
             return dispatch_tree_contours_locked(requests, contour_boxes);
         });
+        runtime_stats_registry().record_tree_result(requests.size(), batch);
+        return batch;
     }
 
     bool prepare_for_slicing()
@@ -423,7 +621,6 @@ public:
             this->initialize();
         });
         auto lock = m_lifecycle.acquire();
-        refresh_intersection_dispatch_mode();
         if (!m_ready) {
             if (m_diagnostic.empty())
                 m_diagnostic = "Vulkan infill compute did not finish initialization.";
@@ -432,13 +629,6 @@ public:
                                                  m_staging_request_capacity);
         }
         return m_ready;
-    }
-
-    bool should_dispatch_vertical_intersections(size_t request_count) const
-    {
-        auto lock = m_lifecycle.acquire();
-        return request_count >= (m_ready ? m_preferred_intersection_batch.load(std::memory_order_acquire)
-                                         : kDefaultPreferredIntersectionBatch);
     }
 
     void release_unused_staging_memory()
@@ -663,10 +853,9 @@ private:
                                                  m_staging_request_capacity);
             return;
         }
-        calibrate_intersection_dispatch_policy();
-        update_execution_profile();
-        runtime_stats_registry().set_preferred_intersection_batch(
-            m_preferred_intersection_batch.load(std::memory_order_acquire));
+        // The public gate uses batch_size(); do not benchmark an unused
+        // private threshold or publish it as the active dispatch policy.
+        runtime_stats_registry().set_preferred_intersection_batch(VulkanSlicerBackend::batch_size());
         m_diagnostic = "Vulkan exact vertical-intersection compute is qualified and ready on " + m_selected_device + ".";
         runtime_stats_registry().set_backend(m_selected_device, m_execution_profile, m_diagnostic,
                                              m_workgroup_size, m_maximum_workgroup_size,
@@ -684,136 +873,12 @@ private:
 
     void update_execution_profile()
     {
-        const size_t preferred_batch = m_preferred_intersection_batch.load(std::memory_order_acquire);
         std::ostringstream profile;
         profile << (m_is_nvidia_rtx ? "NVIDIA RTX" : (m_is_gtx_1060 ? "NVIDIA GTX 1060 / Pascal" : "Generic Vulkan"))
                 << ": " << m_workgroup_size << " threads/group (autotuned; device maximum "
                 << m_maximum_workgroup_size << "), " << m_initial_staging_request_capacity
-                << " reusable requests, "
-                << (m_gpu_priority_mode ? "GPU-priority" : "balanced CPU/GPU")
-                << " batch >= " << preferred_batch;
+                << " reusable requests";
         m_execution_profile = profile.str();
-    }
-
-    void apply_intersection_dispatch_mode()
-    {
-        m_gpu_priority_mode = g_gpu_priority_enabled.load(std::memory_order_acquire);
-        size_t preferred_batch = m_balanced_intersection_batch;
-        if (m_gpu_throughput_is_extremely_slow) {
-            // The variable GPU cost lost to the CPU benchmark, not merely the
-            // one-time dispatch cost. Keeping this device on CPU prevents the
-            // GPU-priority preference from making an entire slice slower.
-            preferred_batch = m_max_requests_per_submission + 1;
-        } else if (m_gpu_priority_mode) {
-            // Transfer/synchronization dominates only truly tiny batches.
-            // This makes a 2.6k batch GPU eligible while retaining a strict
-            // guard against thousands of sub-millisecond submissions.
-            preferred_batch = std::min(kGpuPriorityMinimumIntersectionBatch,
-                                       m_max_requests_per_submission);
-        }
-        m_preferred_intersection_batch.store(preferred_batch, std::memory_order_release);
-    }
-
-    void refresh_intersection_dispatch_mode()
-    {
-        if (!m_ready)
-            return;
-        const bool requested_gpu_priority = g_gpu_priority_enabled.load(std::memory_order_acquire);
-        if (requested_gpu_priority == m_gpu_priority_mode)
-            return;
-        apply_intersection_dispatch_mode();
-        update_execution_profile();
-        runtime_stats_registry().set_preferred_intersection_batch(
-            m_preferred_intersection_batch.load(std::memory_order_acquire));
-    }
-
-    void calibrate_intersection_dispatch_policy()
-    {
-        const char* policy = std::getenv("ORCA_VULKAN_SLICER_POLICY");
-        if (policy != nullptr && std::string(policy) == "cpu") {
-            m_gpu_throughput_is_extremely_slow = true;
-            m_balanced_intersection_batch = m_max_requests_per_submission + 1;
-            apply_intersection_dispatch_mode();
-            return;
-        }
-        if (policy != nullptr && std::string(policy) == "gpu") {
-            m_gpu_throughput_is_extremely_slow = false;
-            m_balanced_intersection_batch = kGpuPriorityMinimumIntersectionBatch;
-            apply_intersection_dispatch_mode();
-            return;
-        }
-
-        const size_t small_count = std::min<size_t>(4096, m_max_requests_per_submission);
-        const size_t large_count = std::min<size_t>(32768, m_max_requests_per_submission);
-        if (small_count < 256 || large_count <= small_count) {
-            m_balanced_intersection_batch = kDefaultPreferredIntersectionBatch;
-            apply_intersection_dispatch_mode();
-            return;
-        }
-
-        std::vector<VulkanVerticalIntersectionRequest> requests;
-        requests.reserve(large_count);
-        for (size_t index = 0; index < large_count; ++index) {
-            const int64_t left = -900000 + int64_t(index % 509) * 73;
-            const int64_t right = left + 3001 + int64_t(index % 127);
-            requests.push_back({ { { left, -700000 + int64_t(index) * 13 },
-                                   { right, 900000 - int64_t(index) * 17 } },
-                                 left + 1 + int64_t(index % (right - left - 1)), uint64_t(index) });
-        }
-        const std::vector<VulkanVerticalIntersectionRequest> small(requests.begin(), requests.begin() + small_count);
-        const VulkanVerticalIntersectionBatch gpu_small = dispatch_locked(small);
-        const VulkanVerticalIntersectionBatch gpu_large = dispatch_locked(requests);
-        if (!gpu_small.dispatched || !gpu_large.dispatched) {
-            m_balanced_intersection_batch = kDefaultPreferredIntersectionBatch;
-            apply_intersection_dispatch_mode();
-            return;
-        }
-
-        constexpr int cpu_repetitions = 8;
-        volatile int64_t checksum = 0;
-        const auto cpu_start = std::chrono::steady_clock::now();
-        for (int repetition = 0; repetition < cpu_repetitions; ++repetition) {
-            for (const VulkanVerticalIntersectionRequest& request : requests) {
-                const int64_t denominator = request.segment.b.x > request.segment.a.x ?
-                    request.segment.b.x - request.segment.a.x : request.segment.a.x - request.segment.b.x;
-                const int64_t t_numerator = request.segment.b.x > request.segment.a.x ?
-                    request.scan_x - request.segment.a.x : request.segment.a.x - request.scan_x;
-                checksum += t_numerator * (request.segment.b.y - request.segment.a.y) +
-                    request.segment.a.y * denominator;
-            }
-        }
-        const double cpu_per_request_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - cpu_start).count() / (cpu_repetitions * large_count);
-        (void)checksum;
-        const double gpu_per_request_ms = std::max(0.0, gpu_large.host_elapsed_ms - gpu_small.host_elapsed_ms) /
-            double(large_count - small_count);
-        const double gpu_fixed_overhead_ms = std::max(0.0, gpu_small.host_elapsed_ms - gpu_per_request_ms * small_count);
-        // Packing and CPU topology still remain after this GPU result arrives.
-        // Only a conservative fraction of the arithmetic benchmark is treated
-        // as recoverable CPU work when choosing the crossover point.
-        const double recoverable_cpu_per_request_ms = cpu_per_request_ms * 0.35;
-        if (gpu_per_request_ms >= recoverable_cpu_per_request_ms) {
-            // GPU-priority mode is intentionally permissive. A synchronized
-            // micro-benchmark may make the GPU look slower even when a real
-            // slice has enough parallel work to benefit. Only reject a device
-            // if the *large* calibrated submission is both materially long
-            // and many times slower than the full CPU reference.
-            constexpr double extreme_gpu_slowdown_factor = 32.0;
-            constexpr double extreme_gpu_elapsed_ms = 50.0;
-            const double cpu_large_reference_ms = cpu_per_request_ms * double(large_count);
-            m_gpu_throughput_is_extremely_slow =
-                gpu_large.host_elapsed_ms >= extreme_gpu_elapsed_ms &&
-                gpu_large.host_elapsed_ms >= cpu_large_reference_ms * extreme_gpu_slowdown_factor;
-            m_balanced_intersection_batch = m_max_requests_per_submission + 1;
-            apply_intersection_dispatch_mode();
-            return;
-        }
-        const size_t crossover = size_t(std::ceil(gpu_fixed_overhead_ms /
-            (recoverable_cpu_per_request_ms - gpu_per_request_ms)));
-        m_gpu_throughput_is_extremely_slow = false;
-        m_balanced_intersection_batch = std::clamp<size_t>(crossover, kDefaultPreferredIntersectionBatch,
-                                                            std::min<size_t>(65536, m_max_requests_per_submission));
-        apply_intersection_dispatch_mode();
     }
 
     bool create_compute_pipeline(uint32_t workgroup_size, VkPipeline& pipeline)
@@ -1321,8 +1386,6 @@ private:
     size_t          m_tree_request_capacity { 0 };
     size_t          m_tree_edge_capacity { 0 };
     size_t          m_initial_staging_request_capacity { kGenericStagingRequestCapacity };
-    std::atomic_size_t m_preferred_intersection_batch { kDefaultPreferredIntersectionBatch };
-    size_t          m_balanced_intersection_batch { kDefaultPreferredIntersectionBatch };
     size_t          m_max_requests_per_submission { 0 };
     size_t          m_storage_buffer_request_limit { 0 };
     uint32_t        m_workgroup_size { kDefaultWorkgroupSize };
@@ -1334,13 +1397,9 @@ private:
     bool            m_is_gtx_1060 { false };
     bool            m_is_nvidia_rtx { false };
     bool            m_compute_timestamps_available { false };
-    bool            m_gpu_throughput_is_extremely_slow { false };
-    bool            m_gpu_priority_mode { true };
     bool           m_ready { false };
     std::string    m_diagnostic;
 
-    static constexpr size_t kDefaultPreferredIntersectionBatch = 4096;
-    static constexpr size_t kGpuPriorityMinimumIntersectionBatch = 512;
 };
 
 VulkanIntersectionContext& vulkan_intersection_context()
@@ -1478,18 +1537,24 @@ VulkanVerticalIntersectionBatch VulkanSlicerBackend::dispatch_vertical_intersect
     // retain CPU geometry without initializing a CUDA context.
     if ((preference == ComputeBackendPreference::Cuda || preference == ComputeBackendPreference::Auto) && cuda_enabled()) {
         VulkanVerticalIntersectionBatch cuda_batch = CudaSlicerBackend::dispatch_vertical_intersections(requests);
+        // A completed device submission remains an attempt even when the
+        // exact acceptance gate rejects every result and we retain CPU output.
+        runtime_stats_registry().record_dispatch(requests.size(), cuda_batch);
         if (cuda_batch.dispatched) {
             runtime_stats_registry().set_compute_selection("CUDA", true, false);
-            runtime_stats_registry().record_dispatch(requests.size(), cuda_batch);
             return cuda_batch;
         }
         batch.diagnostic = cuda_batch.diagnostic;
+        if (cuda_safety_state().quarantined())
+            runtime_stats_registry().record_vertical_failure(cuda_batch.diagnostic);
     }
 
 #ifdef SLIC3R_ENABLE_VULKAN_SLICER
     if ((preference == ComputeBackendPreference::Cuda || preference == ComputeBackendPreference::Vulkan || preference == ComputeBackendPreference::Auto) &&
         compute_enabled()) {
         VulkanVerticalIntersectionBatch vulkan_batch = vulkan_intersection_context().dispatch(requests);
+        if (!vulkan_batch.dispatched && vulkan_safety_state().quarantined())
+            runtime_stats_registry().record_vertical_failure(vulkan_batch.diagnostic);
         if (vulkan_batch.dispatched || batch.diagnostic.empty())
             batch = std::move(vulkan_batch);
         else

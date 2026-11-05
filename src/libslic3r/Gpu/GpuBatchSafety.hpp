@@ -7,6 +7,7 @@
 #include <chrono>
 #include <exception>
 #include <unordered_set>
+#include <utility>
 
 namespace Slic3r::Gpu {
 
@@ -64,6 +65,15 @@ inline bool checked_vertical_reference(const VerticalIntersectionRequest& reques
 template<class Requests>
 bool unique_stable_ids(const Requests& requests)
 {
+    // Product adapters emit increasing IDs. Comparing rather than incrementing
+    // also handles gaps and UINT64_MAX without allocating or overflowing.
+    if (std::adjacent_find(requests.begin(), requests.end(), [](const auto& left, const auto& right) {
+            return left.stable_id >= right.stable_id;
+        }) == requests.end())
+        return true;
+
+    // Arbitrary input order is still supported. Include the complete prefix:
+    // a later ID may duplicate one before the first non-increasing pair.
     std::unordered_set<uint64_t> ids;
     ids.reserve(requests.size());
     for (const auto& request : requests)
@@ -72,14 +82,46 @@ bool unique_stable_ids(const Requests& requests)
     return true;
 }
 
-inline bool preflight_vertical_batch(const std::vector<VerticalIntersectionRequest>& requests)
+namespace detail {
+
+inline bool preflight_vertical_batch(const std::vector<VerticalIntersectionRequest>& requests,
+                                     std::vector<VerticalIntersection>* reference)
 {
     if (requests.empty() || requests.size() > maximum_intersection_requests || !unique_stable_ids(requests))
         return false;
+    if (reference != nullptr)
+        reference->reserve(requests.size());
     VerticalIntersection result;
-    return std::all_of(requests.begin(), requests.end(), [&](const auto& request) {
-        return checked_vertical_reference(request, result);
-    });
+    for (const auto& request : requests) {
+        if (!checked_vertical_reference(request, result))
+            return false;
+        if (reference != nullptr)
+            reference->push_back(result);
+    }
+    return true;
+}
+
+inline bool matches_vertical_reference(const VerticalIntersection& expected,
+                                       const VerticalIntersection& actual)
+{
+    return actual.valid && actual.stable_id == expected.stable_id &&
+           actual.numerator == expected.numerator && actual.denominator == expected.denominator;
+}
+
+inline bool validate_vertical_reference(const std::vector<VerticalIntersection>& reference,
+                                        const VerticalIntersectionBatch& batch)
+{
+    if (!batch.dispatched || batch.intersections.size() != reference.size())
+        return false;
+    return std::equal(reference.begin(), reference.end(), batch.intersections.begin(),
+                      matches_vertical_reference);
+}
+
+} // namespace detail
+
+inline bool preflight_vertical_batch(const std::vector<VerticalIntersectionRequest>& requests)
+{
+    return detail::preflight_vertical_batch(requests, nullptr);
 }
 
 inline bool validate_vertical_batch(const std::vector<VerticalIntersectionRequest>& requests,
@@ -90,9 +132,8 @@ inline bool validate_vertical_batch(const std::vector<VerticalIntersectionReques
     for (size_t index = 0; index < requests.size(); ++index) {
         VerticalIntersection expected;
         const auto& actual = batch.intersections[index];
-        if (!checked_vertical_reference(requests[index], expected) || !actual.valid ||
-            actual.stable_id != expected.stable_id || actual.numerator != expected.numerator ||
-            actual.denominator != expected.denominator)
+        if (!checked_vertical_reference(requests[index], expected) ||
+            !detail::matches_vertical_reference(expected, actual))
             return false;
     }
     return true;
@@ -108,19 +149,25 @@ VerticalIntersectionBatch dispatch_checked_vertical_batch(
     const auto finish = [&] {
         batch.host_elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();
-        return batch;
+        // This lambda captures batch, so returning it by value would copy the
+        // whole result vector rather than receive named-return elision.
+        return std::move(batch);
     };
     if (!enabled || state.quarantined()) {
         batch.diagnostic = "GPU backend disabled or quarantined; retain CPU geometry.";
         return finish();
     }
     try {
-        if (!preflight_vertical_batch(requests)) {
+        // Keep the independently checked values for this call only. Every
+        // returned field is still compared before any result is consumed;
+        // the bounded cache avoids repeating the int256 arithmetic afterward.
+        std::vector<VerticalIntersection> reference;
+        if (!detail::preflight_vertical_batch(requests, &reference)) {
             batch.diagnostic = "GPU numeric domain or bounded batch contract rejected; retain CPU geometry.";
             return finish();
         }
         batch = dispatch();
-        if (validate_vertical_batch(requests, batch) && !state.quarantined())
+        if (detail::validate_vertical_reference(reference, batch) && !state.quarantined())
             return finish();
         state.quarantine();
         batch.diagnostic = "GPU dispatch or complete exact validation failed; backend quarantined. " + batch.diagnostic;

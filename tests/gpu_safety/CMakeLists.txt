@@ -76,8 +76,32 @@ if(SLIC3R_BUILD_GPU_CONTRACT_TESTS)
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
         GIT_TAG 9827c148c397289df17d3967692619a198032a24)
     FetchContent_MakeAvailable(Catch2)
-    add_executable(gpu_safety_tests ../libslic3r/test_gpu_exact_geometry.cpp)
+    add_executable(gpu_safety_tests
+        ../libslic3r/test_gpu_exact_geometry.cpp
+        ../libslic3r/test_gpu_batch_preflight.cpp)
     target_link_libraries(gpu_safety_tests PRIVATE slicer_gpu_core Catch2::Catch2WithMain)
     enable_testing()
     add_test(NAME gpu_safety COMMAND gpu_safety_tests)
 endif()
+
+# This CPU-only child-process fixture includes the production recorder to check
+# normal-exit lifetime, Unicode paths and failed writes without public test hooks.
+add_executable(gpu_exit_diagnostics test_exit_diagnostics.cpp "${GPU_SOURCE_DIR}/CudaSlicer.cpp")
+target_compile_features(gpu_exit_diagnostics PRIVATE cxx_std_17)
+target_include_directories(gpu_exit_diagnostics PRIVATE ${Boost_INCLUDE_DIRS})
+target_link_libraries(gpu_exit_diagnostics PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(gpu_exit_diagnostics PRIVATE /utf-8)
+endif()
+enable_testing()
+add_test(NAME gpu_exit_diagnostics COMMAND gpu_exit_diagnostics)
+
+# Stub only the external CUDA runtime boundary; the real facade and exact gate
+# must account for a completed submission whose result is rejected.
+add_executable(gpu_cuda_accounting test_cuda_submission_accounting.cpp
+    "${GPU_SOURCE_DIR}/VulkanSlicer.cpp" "${GPU_SOURCE_DIR}/CudaSlicer.cpp")
+target_compile_features(gpu_cuda_accounting PRIVATE cxx_std_17)
+target_compile_definitions(gpu_cuda_accounting PRIVATE SLIC3R_ENABLE_CUDA_SLICER=1)
+target_include_directories(gpu_cuda_accounting PRIVATE "${GPU_SOURCE_DIR}" ${Boost_INCLUDE_DIRS})
+target_link_libraries(gpu_cuda_accounting PRIVATE Threads::Threads)
+add_test(NAME gpu_cuda_accounting COMMAND gpu_cuda_accounting)

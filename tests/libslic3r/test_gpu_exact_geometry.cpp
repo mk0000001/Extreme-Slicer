@@ -1,4 +1,8 @@
+#if __has_include(<catch2/catch_all.hpp>)
 #include <catch2/catch_all.hpp>
+#else
+#include <catch2/catch.hpp>
+#endif
 
 #include "libslic3r/Gpu/GpuExactGeometry.hpp"
 #include "libslic3r/Gpu/VulkanSlicer.hpp"
