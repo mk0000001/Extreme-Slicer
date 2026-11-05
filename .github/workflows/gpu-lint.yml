@@ -1,0 +1,167 @@
+name: Orca 2.5 RC required clang-tidy
+
+on:
+  push:
+    branches: [ci/gpu-lint-2.5]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SLIC3R_GPU_BACKEND: cpu
+  ORCA_LINT_BASE: af2ffb8cddd2f3c0bdadc56d9cc3945fb23577ea
+  ORCA_PRODUCT_COMMIT: c73c13bf159161af5b1a29269cb09408d5d7c625
+
+jobs:
+  windows-clang-tidy:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: ssrobins/install-cmake@v1
+        with:
+          version: 3.31.6
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+      - name: Record exact source and normal execution policy
+        run: |
+          New-Item -ItemType Directory lint-evidence -Force | Out-Null
+          $log = 'lint-evidence/source-and-policy.log'
+          try {
+            & {
+              git cat-file -e "$($env:ORCA_LINT_BASE)^{commit}"
+              if ($LASTEXITCODE) { throw 'RC comparison base is unavailable despite full-history checkout' }
+              git merge-base --is-ancestor $env:ORCA_PRODUCT_COMMIT HEAD
+              if ($LASTEXITCODE) { throw 'Expected current product source is not an ancestor of this workflow revision' }
+              git rev-parse HEAD
+              git rev-parse HEAD:deps
+              git diff --name-status $env:ORCA_LINT_BASE HEAD
+              Get-ExecutionPolicy -List | Format-Table
+              Get-FileHash scripts/run_clang_tidy.ps1,scripts/clang_tidy_diff.py,scripts/clang_tidy_requirements.txt,.clang-tidy -Algorithm SHA256 | Format-List
+            } *> $log
+          } finally { if (Test-Path $log) { Get-Content $log -Tail 45 } }
+      - name: Download ready exact-manifest dependencies
+        uses: actions/download-artifact@v6
+        with:
+          artifact-ids: '13400603631'
+          repository: mk0000001/Extreme-Slicer
+          run-id: '41989249878'
+          github-token: ${{ github.token }}
+          path: upstream-deps
+      - name: Verify provenance and restore the dependency prefix
+        id: deps
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $log = 'lint-evidence/dependencies.log'
+          try {
+            & {
+              $expectedTree = 'b918997223ff1f95c70218965e0f06aa111cbeab'
+              if ((git rev-parse HEAD:deps).Trim() -ne $expectedTree) { throw 'Dependency manifest differs from the ready artifact' }
+              $archive = @(Get-ChildItem upstream-deps -Recurse -File -Filter 'Orca-2.5-rc-Windows-deps.zip')
+              $provenanceFile = @(Get-ChildItem upstream-deps -Recurse -File -Filter 'dependency-source.txt')
+              if ($archive.Count -ne 1 -or $provenanceFile.Count -ne 1) { throw 'Expected one dependency archive and provenance file' }
+              $digest = (Get-FileHash -LiteralPath $archive[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($digest -ne '28d52165a0438d376cb3b9fe7233c6249db90cdc7859bb8654e13a3f39ab6590') { throw 'Dependency archive digest mismatch' }
+              $provenance = @((Get-Content -LiteralPath $provenanceFile[0].FullName -Raw) -split '[\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+              if ($provenance.Count -lt 3 -or $provenance[0] -ne '16c699c156ffb7fd35f2bdb3c086b6c6d875c9f7' -or $provenance[1] -ne $expectedTree -or $provenance[2] -ne 'cmake version 3.31.6') { throw 'Dependency provenance mismatch' }
+              "$digest  $($archive[0].Name)"
+              $provenance
+              Copy-Item -LiteralPath $provenanceFile[0].FullName -Destination lint-evidence/dependency-source.txt
+              New-Item -ItemType Directory deps/build -Force | Out-Null
+              Expand-Archive -LiteralPath $archive[0].FullName -DestinationPath deps/build
+              foreach ($required in @('lib','include','libpython/python.exe','libpython/libs/python312.lib')) {
+                if (-not (Test-Path (Join-Path 'deps/build/OrcaSlicer_dep/usr/local' $required))) { throw "Missing prebuilt dependency content: $required" }
+              }
+            } *> $log
+          } finally { if (Test-Path $log) { Get-Content $log -Tail 30 } }
+      - name: Run the original required PowerShell check
+        id: product-lint
+        run: |
+          # Invoke normally in a child process so its exit is captured verbatim.
+          # A policy rejection remains a failure; this workflow does not bypass it.
+          Remove-Item Env:CLANG_TIDY -ErrorAction SilentlyContinue
+          $log = 'lint-evidence/original-script.log'
+          $ErrorActionPreference = 'Continue'
+          & pwsh -NoProfile -NonInteractive -File scripts/run_clang_tidy.ps1 -Base $env:ORCA_LINT_BASE -NoFetch -DepsDir deps/build -BuildDir build-tidy -Jobs 2 -Yes *> $log
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path $log) { Get-Content $log -Tail 70 }
+          Write-Host "Original required script exit code: $code (full output in $log)"
+          exit $code
+      - name: Configure and check common CPU GPU-core sources with a real database
+        if: ${{ always() && steps.deps.outcome == 'success' }}
+        run: |
+          $log = 'lint-evidence/core-configure.log'
+          $tidy = "$pwd/build-tidy/clang-tidy-venv/Scripts/clang-tidy.exe"
+          $python = "$pwd/build-tidy/clang-tidy-venv/Scripts/python.exe"
+          try {
+            & {
+              if (-not (Test-Path $tidy) -or -not (Test-Path $python)) { throw 'The original helper did not create its pinned tool environment; inspect its failure without bypassing policy' }
+              $version = (& $tidy --version | Out-String)
+              if ($LASTEXITCODE -or $version -notmatch 'version 22\.1\.8') { throw 'Expected the helper venv clang-tidy 22.1.8' }
+              $version
+              # GitHub steps do not inherit the helper child process's VS environment.
+              $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+              $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+              if (-not $vs) { throw 'Visual Studio C++ tools unavailable' }
+              $devcmd = Join-Path $vs 'Common7/Tools/VsDevCmd.bat'
+              $environment = & cmd /c "set VCToolsInstallDir=& set WindowsSdkDir=& `"$devcmd`" -arch=x64 -host_arch=x64 -no_logo >nul 2>nul & set"
+              if (-not ($environment -match '^VCToolsInstallDir=.') -or -not ($environment -match '^WindowsSdkDir=.')) { throw 'Could not load the normal VS developer environment' }
+              foreach ($line in $environment) {
+                $equal = $line.IndexOf('=')
+                if ($equal -gt 0) { Set-Item -Path ('env:' + $line.Substring(0,$equal)) -Value $line.Substring($equal+1) }
+              }
+              Get-Command cl,ninja,cmake | Select-Object Name,Source
+              cmake -S tests/gpu_safety -B build-tidy-core -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON -DSLIC3R_ENABLE_CUDA_SLICER=OFF -DSLIC3R_ENABLE_VULKAN_SLICER=OFF -DSLIC3R_BUILD_GPU_CONTRACT_TESTS=ON "-DCMAKE_PREFIX_PATH=$pwd/deps/build/OrcaSlicer_dep/usr/local"
+              if ($LASTEXITCODE) { throw 'Standalone core CMake configuration failed' }
+              cmake --build build-tidy-core --target slicer_gpu_core --parallel 2
+              if ($LASTEXITCODE) { throw 'Actual CPU core target compilation failed' }
+              $database = Get-Content build-tidy-core/compile_commands.json -Raw | ConvertFrom-Json
+              foreach ($name in @('VulkanSlicer.cpp','CudaSlicer.cpp')) {
+                $entries = @($database | Where-Object { [System.IO.Path]::GetFileName($_.file) -eq $name })
+                if (-not $entries.Count) { throw "Real standalone compile database omitted $name" }
+                if (-not ($entries | Where-Object { $_.command -match 'c\+\+17' })) { throw "C++17 command missing for $name" }
+                Write-Output "$name has $($entries.Count) real generated compile commands"
+              }
+            } *> $log
+          } finally { if (Test-Path $log) { Get-Content $log -Tail 45 } }
+          $lintLog = 'lint-evidence/common-core-lint.log'
+          $ErrorActionPreference = 'Continue'
+          & $python scripts/clang_tidy_diff.py -p build-tidy-core --base $env:ORCA_LINT_BASE --clang-tidy $tidy -j 2 *> $lintLog
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path $lintLog) { Get-Content $lintLog -Tail 70 }
+          Write-Host "Common core changed-line check exit code: $code (full output in $lintLog)"
+          exit $code
+      - name: Upload complete lint evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: orca-gpu-required-lint-evidence
+          path: |
+            lint-evidence/
+            build-tidy/configure.log
+            build-tidy/git_commit_hash.log
+            build-tidy/CMakeCache.txt
+            build-tidy/compile_commands.json
+            build-tidy/CMakeFiles/CMakeConfigureLog.yaml
+            build-tidy-core/CMakeCache.txt
+            build-tidy-core/compile_commands.json
+            build-tidy-core/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
