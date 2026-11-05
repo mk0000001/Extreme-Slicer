@@ -1,55 +1,208 @@
-name: GPU beta validation
+name: Orca 2.5 RC full GPU app validation
 
 on:
   push:
     branches: [ci/gpu-beta-2.5]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+  actions: read
 
 env:
+  SLIC3R_GPU_BACKEND: cpu
   CMAKE_BUILD_PARALLEL_LEVEL: '2'
 
 jobs:
-  windows-dependencies:
-    runs-on: windows-2022
-    timeout-minutes: 180
+  contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: false
-      - uses: microsoft/setup-msbuild@v2
-        with:
-          vs-version: '[17.0,18.0)'
       - uses: ssrobins/install-cmake@v1
         with:
           version: 3.31.6
-      - name: Install build utilities
-        run: choco install strawberryperl pkgconfiglite --yes --no-progress
-      - name: Cache exact Orca RC dependencies
-        id: deps
-        uses: actions/cache@v6
-        with:
-          path: deps/build/OrcaSlicer_dep
-          key: gpu-beta-orca250rc-windows2022-vs17-release-${{ hashFiles('deps/**') }}
-      - name: Build from this Orca dependency manifest
-        if: steps.deps.outputs.cache-hit != 'true'
-        shell: cmd
-        run: build_win.bat -d --arch x64 --vs 2022 --msvc --msbuild --deps-dir deps/build -j 2
-      - name: Record source provenance
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y libboost-dev
+      - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          git rev-parse HEAD | Set-Content dependency-source.txt
-          git rev-parse HEAD:deps | Add-Content dependency-source.txt
-          cmake --version | Add-Content dependency-source.txt
-      - name: Package dependency prefix
+          Invoke-WebRequest 'https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz' -OutFile boost-source.tar.gz
+          if ((Get-FileHash boost-source.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'a5800f405508f5df8114558ca9855d2640a2de8f0445f051fa1c7c3383045724') { throw 'Boost archive digest mismatch' }
+          tar -xzf boost-source.tar.gz
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "BOOST_ROOT=$pwd/boost_1_84_0" | Add-Content $env:GITHUB_ENV
+      - run: cmake -S tests/gpu_safety -B build-contracts
+      - run: cmake --build build-contracts --config Release --parallel 2
+      - run: ctest --test-dir build-contracts -C Release --output-on-failure --output-junit contracts.xml
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v6
+        with:
+          name: orca-gpu-contract-windows
+          path: build-contracts/Release/gpu_exit_diagnostics.exe
+          if-no-files-found: error
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: orca-gpu-contract-evidence-${{ runner.os }}
+          path: |
+            contracts.xml
+            build-contracts/Testing/Temporary/LastTest.log
+
+  windows-app:
+    needs: contracts
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+      - uses: ssrobins/install-cmake@v1
+        with:
+          version: 3.31.6
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+      # This artifact completed before an unrelated dependency-cache save failed.
+      # Its identity, archive hash and manifest are authoritative; do not rebuild.
+      - name: Download ready exact-manifest Orca dependencies
+        uses: actions/download-artifact@v6
+        with:
+          artifact-ids: '13400603631'
+          repository: mk0000001/Extreme-Slicer
+          run-id: '41989249878'
+          github-token: ${{ github.token }}
+          path: upstream-deps
+      - name: Verify artifact provenance and extract original prefix
         shell: pwsh
-        run: Compress-Archive -Path deps/build/OrcaSlicer_dep -DestinationPath Orca-2.5-rc-Windows-deps.zip
+        run: |
+          $expectedTree = 'b918997223ff1f95c70218965e0f06aa111cbeab'
+          if ((git rev-parse HEAD:deps).Trim() -ne $expectedTree) { throw 'Current source dependency manifest differs from the ready artifact' }
+          $archive = @(Get-ChildItem upstream-deps -Recurse -File -Filter 'Orca-2.5-rc-Windows-deps.zip')
+          $provenanceFile = @(Get-ChildItem upstream-deps -Recurse -File -Filter 'dependency-source.txt')
+          if ($archive.Count -ne 1 -or $provenanceFile.Count -ne 1) { throw 'Expected one dependency ZIP and provenance file' }
+          $digest = (Get-FileHash -LiteralPath $archive[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne '28d52165a0438d376cb3b9fe7233c6249db90cdc7859bb8654e13a3f39ab6590') { throw 'Dependency archive digest mismatch' }
+          # Handles both CRLF and physical CRCRLF without empty-line indexing.
+          $provenance = @((Get-Content -LiteralPath $provenanceFile[0].FullName -Raw) -split '[\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          if ($provenance.Count -lt 3 -or $provenance[0] -ne '16c699c156ffb7fd35f2bdb3c086b6c6d875c9f7' -or $provenance[1] -ne $expectedTree -or $provenance[2] -ne 'cmake version 3.31.6') { throw 'Dependency provenance mismatch' }
+          "$digest  $($archive[0].Name)" | Set-Content dependency-archive-sha256.txt -Encoding ascii
+          Copy-Item -LiteralPath $provenanceFile[0].FullName -Destination dependency-source-used.txt
+          New-Item -ItemType Directory deps/build -Force | Out-Null
+          Expand-Archive -LiteralPath $archive[0].FullName -DestinationPath deps/build
+          $prefix = 'deps/build/OrcaSlicer_dep/usr/local'
+          foreach ($required in @('lib','include','libpython/python.exe','libpython/python312.dll','libpython/libs/python312.lib')) {
+            if (-not (Test-Path (Join-Path $prefix $required))) { throw "Missing dependency prefix content: $required" }
+          }
+      - name: Download this source commit's diagnostic fixture
+        uses: actions/download-artifact@v6
+        with:
+          name: orca-gpu-contract-windows
+          path: contract-tests
+      - name: Install build utilities
+        run: choco install nsis pkgconfiglite --yes --no-progress
+      - name: Install Pascal-capable CUDA
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+          use-github-cache: true
+          use-local-cache: true
+      - name: Install Vulkan compiler
+        run: choco install vulkan-sdk --version=1.4.363 --yes --no-progress
+      - name: Verify official Vulkan runtime
+        shell: pwsh
+        run: |
+          $vk = (Get-ChildItem C:/VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          "VULKAN_SDK=$vk" | Add-Content $env:GITHUB_ENV
+          Invoke-WebRequest 'https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkan-runtime-components.zip' -OutFile vulkan-runtime-components.zip
+          if ((Get-FileHash vulkan-runtime-components.zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'a25a927aa8b9f0371048f1861cf88ac3b9bc9b1fb332c42d897c8ab32695769a') { throw 'Vulkan runtime digest mismatch' }
+          Expand-Archive vulkan-runtime-components.zip vulkan-runtime
+          "VULKAN_RUNTIME_DIR=$pwd/vulkan-runtime/VulkanRT-X64-1.4.363.0-Components" | Add-Content $env:GITHUB_ENV
+      - name: Configure full Orca app and native-framework tests
+        shell: pwsh
+        run: |
+          cmake -S . -B build-gpu -G 'Visual Studio 17 2022' -A x64 -T "cuda=$env:CUDA_PATH" -DBBL_RELEASE_TO_PUBLIC=1 -DBUILD_TESTS=ON -DORCA_TOOLS=ON -DSLIC3R_ENABLE_CUDA_SLICER=ON -DSLIC3R_ENABLE_VULKAN_SLICER=ON -DSLIC3R_GPU_SELFTEST=ON -DCMAKE_CUDA_ARCHITECTURES=61 "-DSLIC3R_VULKAN_RUNTIME_DLL=$env:VULKAN_RUNTIME_DIR/x64/vulkan-1.dll" "-DCMAKE_PREFIX_PATH=$pwd/deps/build/OrcaSlicer_dep/usr/local" "-DCMAKE_INSTALL_PREFIX=$pwd/install-beta" -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build all app and test targets, then install
+        shell: pwsh
+        run: |
+          cmake --build build-gpu --target ALL_BUILD --config Release --parallel 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --install build-gpu --config Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Run full project tests and CPU diagnostic
+        shell: pwsh
+        run: |
+          $env:PATH = "$pwd/install-beta;$env:CUDA_PATH/bin;$env:PATH"
+          $env:SLIC3R_GPU_TEST_RESOURCES = "$pwd/install-beta/resources"
+          # Physical-GPU tests are a separate local hardware gate, not hosted-CI proof.
+          ctest --test-dir build-gpu -C Release --output-on-failure --parallel 2 -LE GpuHardware --output-junit "$pwd/full-app-tests.xml"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:SLIC3R_GPU_DIAGNOSTICS = "$pwd/cpu-selftest-summary.txt"
+          & install-beta/slic3r-gpu-compute-selftest.exe "$pwd/install-beta/resources/vulkan" cpu
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Remove-Item Env:SLIC3R_GPU_DIAGNOSTICS
+          $summary = @{}
+          foreach ($line in Get-Content cpu-selftest-summary.txt) {
+            $parts = $line -split '=', 2
+            if ($parts.Count -eq 2) { $summary[$parts[0]] = $parts[1] }
+          }
+          if ($summary.requested_backend -ne 'cpu' -or $summary.active_backend -ne 'CPU' -or $summary.vertical_accepted -ne '0' -or $summary.queue_submissions -ne '0') { throw 'CPU diagnostic initialized or accepted GPU work unexpectedly' }
+      - name: Package exact-source app, tests and runtime notices
+        shell: pwsh
+        run: |
+          foreach ($required in @('orca-slicer.exe','OrcaSlicer.dll','cudart64_12.dll','vulkan-1.dll','msvcp140.dll','vcruntime140.dll','python/python.exe','resources/tools/uv/uv.exe')) {
+            if (-not (Test-Path (Join-Path install-beta $required))) { throw "Portable app component missing: $required" }
+          }
+          if (@(Get-ChildItem install-beta/resources/vulkan -File -Filter '*.spv').Count -ne 6) { throw 'Shader packaging incomplete' }
+          if (@(git status --porcelain --untracked-files=no).Count) { throw 'Tracked source changed while building; inspect before packaging exact-source output' }
+          New-Item -ItemType Directory install-beta/diagnostics,install-beta/licenses -Force | Out-Null
+          $geometryTest = @(Get-ChildItem build-gpu -Recurse -File -Filter libslic3r_tests.exe)
+          if ($geometryTest.Count -ne 1) { throw 'Expected one full geometry test executable' }
+          Copy-Item -LiteralPath $geometryTest[0].FullName -Destination install-beta/diagnostics
+          Copy-Item contract-tests/gpu_exit_diagnostics.exe install-beta/diagnostics
+          Copy-Item LICENSE.txt install-beta/licenses/LICENSE-AGPL-3.0.txt
+          $cudaNotices = @(Get-ChildItem "$env:CUDA_PATH" -File | Where-Object Name -Match 'LICENSE|EULA')
+          if (-not $cudaNotices.Count) { throw 'CUDA runtime notices missing' }
+          $cudaNotices | Copy-Item -Destination install-beta/licenses
+          Copy-Item "$env:VULKAN_RUNTIME_DIR/VulkanRT-License.txt" install-beta/licenses
+          Copy-Item dependency-source-used.txt install-beta/DEPENDENCIES-SOURCE.txt
+          Copy-Item dependency-archive-sha256.txt install-beta/DEPENDENCIES-SHA256.txt
+          $source = (git rev-parse HEAD).Trim()
+          $source | Set-Content install-beta/SOURCE-COMMIT.txt -Encoding ascii
+          "https://github.com/$env:GITHUB_REPOSITORY/tree/$source" | Set-Content install-beta/SOURCE-URL.txt -Encoding ascii
+          'Experimental OrcaSlicer 2.5 RC GPU beta. CPU is the default. Select SLIC3R_GPU_BACKEND=cuda|vulkan|auto before launching. CUDA12.9.1/sm61. CUDA/Vulkan cover fully validated rectilinear scanline arithmetic; Vulkan alone adds conservative tree broad phase. Set SLIC3R_GPU_DIAGNOSTICS to an absolute local file path for a normal-exit process summary. Hosted CI does not establish physical-GPU correctness, complete-app equivalence or speedup. Local complex-model/toolpath checks remain required. Dependency source and digest are recorded separately from this exact application source commit.' | Set-Content install-beta/BETA-NOTES.txt -Encoding utf8
+          foreach ($mode in @('cpu','cuda','vulkan','auto')) {
+            $lines = @('@echo off', "set SLIC3R_GPU_BACKEND=$mode", 'if not exist "%~dp0beta-profile" mkdir "%~dp0beta-profile"', 'if errorlevel 1 exit /b 1', 'start "" "%~dp0orca-slicer.exe" --datadir "%~dp0beta-profile"')
+            $lines | Set-Content "install-beta/Start-$mode.cmd" -Encoding ascii
+          }
+          @('@echo off','set "PATH=%~dp0;%PATH%"','"%~dp0diagnostics\gpu_exit_diagnostics.exe"','exit /b %errorlevel%') | Set-Content install-beta/Run-exit-diagnostics-test.cmd -Encoding ascii
+          Compress-Archive install-beta OrcaSlicer-2.5-RC-GPU-beta-Windows-sm61.zip
+          $hash = (Get-FileHash OrcaSlicer-2.5-RC-GPU-beta-Windows-sm61.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  OrcaSlicer-2.5-RC-GPU-beta-Windows-sm61.zip" | Set-Content package-sha256.txt -Encoding ascii
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: orca-gpu-app-evidence
+          path: |
+            dependency-source-used.txt
+            dependency-archive-sha256.txt
+            cpu-selftest-summary.txt
+            package-sha256.txt
+            full-app-tests.xml
+            build-gpu/CMakeCache.txt
+            build-gpu/Testing/Temporary/LastTest.log
       - uses: actions/upload-artifact@v6
         with:
-          name: orca250rc-windows-dependencies
-          path: |
-            Orca-2.5-rc-Windows-deps.zip
-            dependency-source.txt
-          retention-days: 14
+          name: OrcaSlicer-2.5-RC-GPU-beta-Windows-sm61
+          path: OrcaSlicer-2.5-RC-GPU-beta-Windows-sm61.zip
+          if-no-files-found: error
