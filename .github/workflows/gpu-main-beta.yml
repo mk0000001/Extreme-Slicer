@@ -2,7 +2,7 @@ name: Orca current main full GPU app validation
 
 on:
   push:
-    branches: [ci/gpu-main-beta-20261105]
+    branches: [ci/gpu-main-arachne-beta-20261106]
   workflow_dispatch:
 
 concurrency:
