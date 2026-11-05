@@ -1,0 +1,95 @@
+name: Windows CUDA OpenGL probe causal control build
+on:
+  push:
+    branches: [ci/gpu-windows-opengl-control]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  helper:
+    if: github.repository == 'mk0000001/Extreme-Slicer'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ssrobins/install-cmake@v1
+        with:
+          version: 3.31.6
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+      - name: Verify source and download header-only Boost
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory opengl-control-evidence -Force | Out-Null
+          git merge-base --is-ancestor 193610fc5acc0c99cba575e5ff143cbb0b631e64 HEAD
+          if ($LASTEXITCODE) { throw 'Unexpected source ancestry' }
+          $expectedBlob = '14295b27c38870e6f4ed41b4e7433d2784845424'
+          if ((git rev-parse 'de4488ad1806d72462c58ebf5f56fcdc8bea5174:src/OrcaSlicer_app_msvc.cpp').Trim() -ne $expectedBlob) { throw 'Source blob mismatch' }
+          if ((git hash-object diagnostics/windows-cuda-opengl-control/OrcaSlicer_app_msvc.original.cpp).Trim() -ne $expectedBlob) { throw 'Pristine source copy mismatch' }
+          $expectedBaseline = 'f0b503ee32eb7e2979b1aecf76343a3c9ee629fe'
+          if ((git rev-parse '193610fc5acc0c99cba575e5ff143cbb0b631e64:diagnostics/windows-cuda-warmup/OrcaSlicer_cuda_warmup_diagnostic.cpp').Trim() -ne $expectedBaseline) { throw 'Prior helper source mismatch' }
+          if ((git hash-object diagnostics/windows-cuda-opengl-control/OrcaSlicer_cuda_warmup.baseline.cpp).Trim() -ne $expectedBaseline) { throw 'Pristine prior helper copy mismatch' }
+          Invoke-WebRequest 'https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz' -OutFile boost-source.tar.gz
+          if ((Get-FileHash boost-source.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'a5800f405508f5df8114558ca9855d2640a2de8f0445f051fa1c7c3383045724') { throw 'Boost source digest mismatch' }
+          tar -xzf boost-source.tar.gz
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --version | Tee-Object opengl-control-evidence/cmake-version.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          msbuild -version | Tee-Object opengl-control-evidence/msbuild-version.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build only the diagnostic wrapper
+        shell: pwsh
+        run: |
+          cmake -S diagnostics/windows-cuda-opengl-control -B build-opengl-control -G 'Visual Studio 17 2022' -A x64 -T v143 "-DBOOST_HEADER_DIR=$pwd/boost_1_84_0" *> opengl-control-evidence/configure.log
+          $code = $LASTEXITCODE
+          Get-Content opengl-control-evidence/configure.log -Tail 80
+          if ($code) { exit $code }
+          cmake --build build-opengl-control --config Release --parallel 2 *> opengl-control-evidence/build.log
+          $code = $LASTEXITCODE
+          Get-Content opengl-control-evidence/build.log -Tail 80
+          if ($code) { exit $code }
+      - name: Package diagnostic and complete source provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory opengl-control-package/source,opengl-control-package/licenses -Force | Out-Null
+          Copy-Item build-opengl-control/Release/orca-cuda-opengl-control.exe opengl-control-package/
+          if (Test-Path build-opengl-control/Release/orca-cuda-opengl-control.pdb) { Copy-Item build-opengl-control/Release/orca-cuda-opengl-control.pdb opengl-control-package/ }
+          Copy-Item diagnostics/windows-cuda-opengl-control/* opengl-control-package/source/
+          Copy-Item .github/workflows/gpu-windows-opengl-control.yml opengl-control-package/source/
+          Copy-Item LICENSE.txt opengl-control-package/licenses/AGPL-3.0.txt
+          Copy-Item boost_1_84_0/LICENSE_1_0.txt opengl-control-package/licenses/Boost-1.0.txt
+          Copy-Item build-opengl-control/CMakeCache.txt opengl-control-evidence/
+          Copy-Item build-opengl-control/CMakeFiles/3.31.6/CMakeCXXCompiler.cmake opengl-control-evidence/
+          git diff --no-index -- diagnostics/windows-cuda-opengl-control/OrcaSlicer_app_msvc.original.cpp diagnostics/windows-cuda-opengl-control/OrcaSlicer_cuda_opengl_control.cpp > opengl-control-package/source/diagnostic-wrapper.patch
+          if ($LASTEXITCODE -ne 1) { throw 'Expected one diagnostic patch' }
+          git diff --no-index -- diagnostics/windows-cuda-opengl-control/OrcaSlicer_cuda_warmup.baseline.cpp diagnostics/windows-cuda-opengl-control/OrcaSlicer_cuda_opengl_control.cpp > opengl-control-package/source/probe-only.patch
+          if ($LASTEXITCODE -ne 1) { throw 'Expected one probe-only diagnostic patch' }
+          $global:LASTEXITCODE = 0
+          $source = (git rev-parse HEAD).Trim()
+          @("ci_commit=$source", 'base_commit=193610fc5acc0c99cba575e5ff143cbb0b631e64', 'production_base=de4488ad1806d72462c58ebf5f56fcdc8bea5174', 'prior_helper_blob=f0b503ee32eb7e2979b1aecf76343a3c9ee629fe', 'original_path=src/OrcaSlicer_app_msvc.cpp', 'original_blob=14295b27c38870e6f4ed41b4e7433d2784845424', "source_url=https://github.com/$env:GITHUB_REPOSITORY/tree/$source", "run_id=$env:GITHUB_RUN_ID", 'configuration=Release', 'generator=Visual Studio 17 2022', 'toolset=v143', 'defines=SLIC3R_GUI=1;SLIC3R_WRAPPER_NOCONSOLE=1;UNICODE;_UNICODE', 'diagnostic_only=true', 'executed_in_ci=false') | Set-Content opengl-control-package/PROVENANCE.txt
+          Copy-Item opengl-control-evidence/* opengl-control-package/source/
+          $manifest = @(Get-ChildItem opengl-control-package -Recurse -File | Sort-Object FullName | ForEach-Object { "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $([IO.Path]::GetRelativePath((Join-Path $pwd 'opengl-control-package'), $_.FullName).Replace('\','/'))" })
+          $manifest | Set-Content opengl-control-package/SHA256SUMS.txt -Encoding ascii
+          Compress-Archive opengl-control-package/* windows-cuda-opengl-control.zip
+          "$((Get-FileHash windows-cuda-opengl-control.zip -Algorithm SHA256).Hash.ToLowerInvariant())  windows-cuda-opengl-control.zip" | Set-Content windows-cuda-opengl-control.sha256 -Encoding ascii
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-cuda-opengl-control
+          path: |
+            windows-cuda-opengl-control.zip
+            windows-cuda-opengl-control.sha256
+          if-no-files-found: error
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-cuda-opengl-build-evidence
+          path: opengl-control-evidence/
+          if-no-files-found: error
