@@ -61,7 +61,7 @@ jobs:
           if (Test-Path build-warmup/Release/orca-cuda-entry-diagnostic.pdb) { Copy-Item build-warmup/Release/orca-cuda-entry-diagnostic.pdb warmup-package/ }
           Copy-Item diagnostics/windows-cuda-warmup/* warmup-package/source/
           Copy-Item .github/workflows/gpu-windows-warmup-diagnostic.yml warmup-package/source/
-          Copy-Item LICENSE warmup-package/licenses/AGPL-3.0.txt
+          Copy-Item LICENSE.txt warmup-package/licenses/AGPL-3.0.txt
           Copy-Item boost_1_84_0/LICENSE_1_0.txt warmup-package/licenses/Boost-1.0.txt
           Copy-Item build-warmup/CMakeCache.txt warmup-evidence/
           Copy-Item build-warmup/CMakeFiles/3.31.6/CMakeCXXCompiler.cmake warmup-evidence/
