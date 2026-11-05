@@ -1,0 +1,92 @@
+name: GPU runtime validation
+
+on:
+  push:
+    branches: [ci/gpu-runtime-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-contracts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ssrobins/install-cmake@v1
+        with:
+          version: 3.31.6
+      - run: sudo apt-get update -qq && sudo apt-get install -y libboost-dev
+      - run: cmake -S tests/gpu_safety -B build-gpu
+      - run: cmake --build build-gpu --parallel 2
+      - run: ctest --test-dir build-gpu --output-on-failure
+
+  windows-cuda-vulkan:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ssrobins/install-cmake@v1
+        with:
+          version: 3.31.6
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+      - name: Install Pascal-capable CUDA compiler
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+          use-github-cache: true
+          use-local-cache: true
+      - name: Install Vulkan compiler and development headers
+        run: choco install vulkan-sdk --yes --no-progress
+      - name: Fetch verified Boost headers
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://github.com/boostorg/boost/releases/download/boost-1.84.0/boost-1.84.0.tar.gz' -OutFile boost-source.tar.gz
+          if ((Get-FileHash boost-source.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant() -ne '4d27e9efed0f6f152dc28db6430b9d3dfb40c0345da7342eaa5a987dde57bd95') { throw 'Boost archive digest mismatch' }
+          tar -xzf boost-source.tar.gz
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $boost = (Get-ChildItem -Directory -Filter 'boost*' | Where-Object { Test-Path (Join-Path $_.FullName 'boost/version.hpp') } | Select-Object -First 1).FullName
+          if (-not $boost) { throw 'Boost header layout missing' }
+          "BOOST_ROOT=$boost" | Add-Content $env:GITHUB_ENV
+          $vk = (Get-ChildItem 'C:/VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          if (-not $vk) { throw 'Vulkan SDK missing' }
+          "VULKAN_SDK=$vk" | Add-Content $env:GITHUB_ENV
+      - name: Configure the actual CUDA and Vulkan backends
+        shell: pwsh
+        run: |
+          nvcc --version
+          cmake -S tests/gpu_safety -B build-gpu -G 'Visual Studio 17 2022' -A x64 -T "cuda=$env:CUDA_PATH" -DSLIC3R_ENABLE_CUDA_SLICER=ON -DSLIC3R_ENABLE_VULKAN_SLICER=ON -DCMAKE_CUDA_ARCHITECTURES=61 "-DBOOST_ROOT=$env:BOOST_ROOT"
+      - run: cmake --build build-gpu --config Release --parallel 2
+      - name: Contract tests and CPU fallback with both backends compiled
+        shell: pwsh
+        run: |
+          ctest --test-dir build-gpu -C Release --output-on-failure
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build-gpu/Release/slicer-gpu-selftest.exe build-gpu/resources/vulkan cpu
+      - name: Package kernel diagnostic and matching runtimes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path gpu-diagnostic/resources/vulkan -Force | Out-Null
+          Copy-Item build-gpu/Release/*.exe gpu-diagnostic
+          Copy-Item build-gpu/resources/vulkan/*.spv gpu-diagnostic/resources/vulkan
+          $cudart = Get-ChildItem "$env:CUDA_PATH/bin" -Filter 'cudart64_12.dll' | Select-Object -First 1
+          $loader = Get-Item "$env:VULKAN_SDK/Bin/vulkan-1.dll"
+          if (-not $cudart -or -not $loader) { throw 'Portable GPU runtime missing' }
+          Copy-Item $cudart.FullName gpu-diagnostic
+          Copy-Item $loader.FullName gpu-diagnostic
+          Copy-Item LICENSE.txt gpu-diagnostic/LICENSE-AGPL-3.0.txt
+          New-Item -ItemType Directory -Path gpu-diagnostic/licenses -Force | Out-Null
+          Get-ChildItem "$env:CUDA_PATH" -File | Where-Object Name -Match 'LICENSE|EULA' | Copy-Item -Destination gpu-diagnostic/licenses
+          if (Test-Path "$env:VULKAN_SDK/License") { Copy-Item "$env:VULKAN_SDK/License" gpu-diagnostic/licenses/VulkanSDK -Recurse }
+          git rev-parse HEAD | Set-Content gpu-diagnostic/SOURCE-COMMIT.txt
+          'This is a compute diagnostic, not the slicer app. Run slicer-gpu-selftest.exe resources/vulkan cuda or vulkan. Both must dispatch and validate; no speedup is claimed.' | Set-Content gpu-diagnostic/README.txt
+          Compress-Archive gpu-diagnostic GPU-kernel-diagnostic-Windows-sm61.zip
+          Get-FileHash GPU-kernel-diagnostic-Windows-sm61.zip -Algorithm SHA256 | Format-List
+      - uses: actions/upload-artifact@v6
+        with:
+          name: gpu-kernel-diagnostic-windows-sm61
+          path: GPU-kernel-diagnostic-Windows-sm61.zip
