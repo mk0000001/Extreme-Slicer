@@ -36,6 +36,7 @@
 #include <catch2/catch_message.hpp>
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/PresetCacheFormat.hpp"
+#include "libslic3r/Exception.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/Utils.hpp"
 
@@ -2305,4 +2306,172 @@ TEST_CASE("a load that fails to install partway counts no errors of the sub-file
     // B's missing parent and B's failed install.
     CHECK(bundle.error_count() == 2);
     CHECK(bundle.prints.find_preset("Acme A", false) != nullptr);
+}
+
+// The supplier always reads a real profile through the production version parser.
+TEST_CASE("a missing or corrupt cache does not read the profile just for its version", "[VendorCache][LazyVendorVersion]")
+{
+    TempDir tmp;
+    const std::string profile = write_vendor_json(tmp.path, "Acme");
+    const std::string cache = (tmp.path / "Acme.opc").string();
+    SECTION("missing") {}
+    SECTION("CRC failure") {
+        REQUIRE(save_one_vendor(cache, one_vendor("Acme"), "Acme", "1.0.0"));
+        corrupt_blob_byte(cache);
+    }
+    SECTION("bad magic") {
+        REQUIRE(save_one_vendor(cache, one_vendor("Acme"), "Acme", "1.0.0"));
+        std::fstream stream(cache, std::ios::in | std::ios::out | std::ios::binary);
+        stream.put('?');
+    }
+    SECTION("truncated header") { std::ofstream(cache) << "short"; }
+    SECTION("size mismatch") {
+        REQUIRE(save_one_vendor(cache, one_vendor("Acme"), "Acme", "1.0.0"));
+        fs::resize_file(cache, fs::file_size(cache) - 1);
+    }
+    int reads = 0;
+    const auto version = [&] { ++ reads; return get_version_from_json(profile); };
+    VendorCacheData data;
+    VendorProfile vendor;
+    CHECK_FALSE(VendorCacheFile::load(cache, "Acme", version, data));
+    CHECK_FALSE(VendorCacheFile::load_vendor_profile(cache, "Acme", version, vendor));
+    CHECK(reads == 0);
+}
+
+TEST_CASE("a valid cache reads its expected profile version once", "[VendorCache][LazyVendorVersion]")
+{
+    TempDir tmp;
+    const std::string profile = write_vendor_json(tmp.path, "Acme");
+    const std::string cache = (tmp.path / "Acme.opc").string();
+    REQUIRE(save_one_vendor(cache, one_vendor("Acme"), "Acme", "1.0.0", {filament_entry("Acme PLA")}));
+    int reads = 0;
+    const auto version = [&] { ++ reads; return get_version_from_json(profile); };
+    VendorCacheData eager, lazy;
+    REQUIRE(VendorCacheFile::load(cache, "Acme", Semver("1.0.0"), eager));
+    REQUIRE(VendorCacheFile::load(cache, "Acme", version, lazy));
+    CHECK(reads == 1);
+    REQUIRE(lazy.filament_entries.size() == eager.filament_entries.size());
+    REQUIRE(lazy.filament_entries.size() == 1);
+    CHECK(lazy.filament_entries.front().name == eager.filament_entries.front().name);
+    CHECK(lazy.filament_entries.front().config_src.equals(eager.filament_entries.front().config_src));
+    CHECK(vendor_deep_equal(lazy.vendors.at("Acme"), eager.vendors.at("Acme")));
+    VendorProfile vendor;
+    REQUIRE(VendorCacheFile::load_vendor_profile(cache, "Acme", version, vendor));
+    CHECK(reads == 2);
+    CHECK(vendor_deep_equal(vendor, eager.vendors.at("Acme")));
+}
+
+TEST_CASE("lazy cache versions retain profile freshness and stamp rejection", "[VendorCache][LazyVendorVersion]")
+{
+    TempDir tmp;
+    std::string profile;
+    std::string expected = "Acme";
+    bool wrong_format = false;
+    SECTION("newer profile") { profile = write_vendor_json(tmp.path, "Acme", "2.0.0"); }
+    SECTION("invalid profile version") { profile = write_vendor_json(tmp.path, "Acme", "not-a-version"); }
+    SECTION("malformed profile JSON") {
+        profile = (tmp.path / "Acme.json").string();
+        std::ofstream(profile) << "{ malformed";
+    }
+    SECTION("wrong vendor") { profile = write_vendor_json(tmp.path, "Acme"); expected = "Wrong"; }
+    SECTION("unknown body format with valid CRC") { profile = write_vendor_json(tmp.path, "Acme"); wrong_format = true; }
+    const std::string cache = (tmp.path / "Acme.opc").string();
+    REQUIRE(save_one_vendor(cache, one_vendor("Acme"), "Acme", "1.0.0"));
+    if (wrong_format) {
+        const uint32_t unknown_version = 0xFFFFFFFF;
+        patch_payload_bytes(cache, 0, &unknown_version, sizeof(unknown_version));
+    }
+    int reads = 0;
+    const auto version = [&] { ++ reads; return get_version_from_json(profile); };
+    VendorCacheData data;
+    // Wrong identity is rejected even when the body and profile version are valid.
+    CHECK_FALSE(VendorCacheFile::load(cache, expected, version, data));
+    CHECK(reads == 1);
+}
+
+TEST_CASE("a lazy cache-only load retains the infinite expected-version rule", "[VendorCache][LazyVendorVersion]")
+{
+    TempDir tmp;
+    const std::string cache = (tmp.path / "Acme.opc").string();
+    REQUIRE(save_one_vendor(cache, one_vendor("Acme"), "Acme", "1.0.0"));
+    int calls = 0;
+    const auto version = [&] { ++ calls; return Semver::inf(); };
+    VendorCacheData data;
+    REQUIRE(VendorCacheFile::load(cache, "Acme", version, data));
+    CHECK(calls == 1);
+    CHECK(data.vendors.at("Acme").config_version == Semver("1.0.0"));
+}
+
+TEST_CASE("an expected-version supplier exception is not a cache format error", "[VendorCache][LazyVendorVersion]")
+{
+    TempDir tmp;
+    const std::string profile = write_vendor_json(tmp.path, "Acme");
+    const std::string cache = (tmp.path / "Acme.opc").string();
+    int reads = 0;
+    const auto version = [&]() -> Semver {
+        ++ reads;
+        const Semver parsed = get_version_from_json(profile);
+        REQUIRE(parsed == Semver("1.0.0"));
+        throw std::runtime_error("version supplier failure");
+    };
+    VendorCacheData data;
+    bool loaded = true;
+    CHECK_NOTHROW(loaded = VendorCacheFile::load(cache, "Acme", version, data));
+    CHECK_FALSE(loaded);
+    CHECK(reads == 0);
+    REQUIRE(save_one_vendor(cache, one_vendor("Acme"), "Acme", "1.0.0"));
+    CHECK_THROWS_AS(VendorCacheFile::load(cache, "Acme", version, data), std::runtime_error);
+    CHECK(reads == 1);
+    VendorProfile vendor;
+    CHECK_THROWS_AS(VendorCacheFile::load_vendor_profile(cache, "Acme", version, vendor), std::runtime_error);
+    CHECK(reads == 2);
+}
+
+TEST_CASE("cold and rejected vendor caches retain complete JSON preset results", "[VendorCache][LazyVendorVersion]")
+{
+    InstallDirs dirs;
+    write_full_vendor_tree(dirs.system, "Acme", "1.0.0");
+    SECTION("missing cache") {}
+    SECTION("bad CRC cache") {
+        REQUIRE(save_one_vendor((dirs.system / "Acme.opc").string(), one_vendor("Acme"), "Acme", "1.0.0"));
+        corrupt_blob_byte((dirs.system / "Acme.opc").string());
+    }
+    PresetBundle expected, actual;
+    const auto reference = expected.load_vendor_configs_from_json(dirs.system.string(), "Acme", PresetBundle::LoadSystem,
+        ForwardCompatibilitySubstitutionRule::EnableSilent, nullptr, false);
+    const auto result = actual.load_vendor_configs_from_json(dirs.system.string(), "Acme", PresetBundle::LoadSystem,
+        ForwardCompatibilitySubstitutionRule::EnableSilent);
+    CHECK(result.second == reference.second);
+    CHECK(result.first.size() == reference.first.size());
+    CHECK(actual.error_count() == expected.error_count());
+    CHECK(vendor_deep_equal(actual.vendors.at("Acme"), expected.vendors.at("Acme")));
+    const PresetCollection *collections[] = {&actual.prints, &actual.filaments, &actual.printers};
+    for (const auto *pair : collections) {
+        const PresetCollection &reference_collection = pair == &actual.prints ? expected.prints :
+            pair == &actual.filaments ? expected.filaments : expected.printers;
+        const auto found = presets_for(*pair, "Acme");
+        const auto wanted = presets_for(reference_collection, "Acme");
+        REQUIRE(found.size() == wanted.size());
+        for (size_t i = 0; i < found.size(); ++ i)
+            CHECK(preset_deep_equal(*found[i], *wanted[i]));
+    }
+}
+
+TEST_CASE("a missing cache still reports the authoritative malformed vendor JSON error", "[VendorCache][LazyVendorVersion]")
+{
+    TempDir tmp;
+    std::ofstream((tmp.path / "Acme.json").string()) << "{ malformed";
+    auto failure = [&](bool allow_cache) {
+        PresetBundle bundle;
+        try {
+            bundle.load_vendor_configs_from_json(tmp.path.string(), "Acme", PresetBundle::LoadSystem,
+                ForwardCompatibilitySubstitutionRule::EnableSilent, nullptr, allow_cache);
+        } catch (const ConfigurationError &error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    const std::string expected = failure(false);
+    REQUIRE_FALSE(expected.empty());
+    CHECK(failure(true) == expected);
 }
