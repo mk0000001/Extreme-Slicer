@@ -1,8 +1,8 @@
-name: Orca current main direct include full GPU app validation
+name: orca-main experimental CUDA buffer reuse combined validation
 
 on:
   push:
-    branches: [ci/gpu-main-include-beta-20261106]
+    branches: [ci/orca-main-cuda-reuse-combined-20261106]
   workflow_dispatch:
 
 concurrency:
@@ -42,6 +42,15 @@ jobs:
       - run: cmake -S tests/gpu_safety -B build-contracts
       - run: cmake --build build-contracts --config Release --parallel 2
       - run: ctest --test-dir build-contracts -C Release --output-on-failure --output-junit contracts.xml
+      - name: Validate 145 assertions in all 17 CUDA buffer host contract cases
+        shell: pwsh
+        run: |
+          $test = @(Get-ChildItem build-contracts -Recurse -File | Where-Object { $_.Name -in @('gpu_safety_tests','gpu_safety_tests.exe') })
+          if ($test.Count -ne 1) { throw 'Missing or ambiguous standalone GPU safety test executable' }
+          & $test[0].FullName '[CudaDispatchBuffers]' --reporter xml --out "$pwd/cuda-dispatch-buffers-contract.xml"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python .github/gpu-validation/check_cuda_buffer_results.py --xml cuda-dispatch-buffers-contract.xml --source tests/libslic3r/test_cuda_dispatch_buffers.cpp
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v6
         with:
@@ -54,6 +63,7 @@ jobs:
           name: orca-gpu-contract-evidence-${{ runner.os }}
           path: |
             contracts.xml
+            cuda-dispatch-buffers-contract.xml
             build-contracts/Testing/Temporary/LastTest.log
 
   windows-app:
@@ -139,6 +149,18 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --install build-gpu --config Release
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Validate CUDA buffer contracts in actual maintained application target
+        shell: pwsh
+        run: |
+          $env:PATH = "$pwd/install-beta;$env:CUDA_PATH/bin;$env:PATH"
+          $env:SLIC3R_GPU_BACKEND = 'cpu'
+          $env:SLIC3R_GPU_TEST_RESOURCES = "$pwd/install-beta/resources"
+          $test = @(Get-ChildItem build-gpu -Recurse -File -Filter libslic3r_tests.exe)
+          if ($test.Count -ne 1) { throw 'Missing or ambiguous actual libslic3r test executable' }
+          & $test[0].FullName '[CudaDispatchBuffers]' --reporter xml --out "$pwd/cuda-dispatch-buffers-app.xml"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python .github/gpu-validation/check_cuda_buffer_results.py --xml cuda-dispatch-buffers-app.xml --source tests/libslic3r/test_cuda_dispatch_buffers.cpp
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Run full project tests and CPU diagnostic
         shell: pwsh
         run: |
@@ -199,6 +221,7 @@ jobs:
             cpu-selftest-summary.txt
             package-sha256.txt
             full-app-tests.xml
+            cuda-dispatch-buffers-app.xml
             build-gpu/CMakeCache.txt
             build-gpu/Testing/Temporary/LastTest.log
       - uses: actions/upload-artifact@v6
