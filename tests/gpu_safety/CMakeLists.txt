@@ -78,6 +78,7 @@ if(SLIC3R_BUILD_GPU_CONTRACT_TESTS)
         GIT_TAG 9827c148c397289df17d3967692619a198032a24)
     FetchContent_MakeAvailable(Catch2)
     add_executable(gpu_safety_tests
+        ../libslic3r/test_cuda_dispatch_buffers.cpp
         ../libslic3r/test_gpu_exact_geometry.cpp
         ../libslic3r/test_gpu_batch_preflight.cpp)
     target_link_libraries(gpu_safety_tests PRIVATE slicer_gpu_core Catch2::Catch2WithMain)
