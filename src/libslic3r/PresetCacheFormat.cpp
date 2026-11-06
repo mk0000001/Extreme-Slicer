@@ -8,6 +8,7 @@
 #include <cereal/cereal.hpp>
 #include <ios>
 #include <exception>
+#include <functional>
 #include <boost/filesystem/operations.hpp>
 #include <memory>
 #include <sstream>
@@ -473,13 +474,16 @@ bool VendorCacheFile::save(const std::string& path, const std::string& vendor_na
 
 // Reads a cache through its vendor profiles under the checks load() documents, then
 // calls read_rest on the archive.
-template<class ReadRest>
+template<class VersionSupplier, class ReadRest>
 static bool read_cache_up_to_presets(const std::string& path, const std::string& expected_vendor_name,
-                                     const Semver& expected_vendor_version, VendorMap& vendors, ReadRest&& read_rest)
+                                     VersionSupplier&& version_supplier, VendorMap& vendors, ReadRest&& read_rest)
 {
     std::string blob;
     if (! read_cache_blob(path, blob))
         return false;
+    // A missing or corrupt body cannot use a profile version. Keep supplier
+    // exceptions outside the format-error catch, as with an eager caller.
+    const Semver& expected_vendor_version = version_supplier();
     try {
         // Read in place: an istringstream would copy the blob once more just to
         // stream over it.
@@ -501,11 +505,11 @@ static bool read_cache_up_to_presets(const std::string& path, const std::string&
     }
 }
 
-// static
-bool VendorCacheFile::load(const std::string& path, const std::string& expected_vendor_name,
-                           const Semver& expected_vendor_version, VendorCacheData& data)
+template<class VersionSupplier>
+static bool read_vendor_data(const std::string& path, const std::string& expected_vendor_name,
+                             VersionSupplier&& version_supplier, VendorCacheData& data)
 {
-    return read_cache_up_to_presets(path, expected_vendor_name, expected_vendor_version, data.vendors,
+    return read_cache_up_to_presets(path, expected_vendor_name, std::forward<VersionSupplier>(version_supplier), data.vendors,
         [&data](cereal::BinaryInputArchive& ar, const CacheDictionary& dict) {
             load_entries(ar, data.process_entries, dict);
             load_entries(ar, data.filament_entries, dict);
@@ -514,16 +518,46 @@ bool VendorCacheFile::load(const std::string& path, const std::string& expected_
         });
 }
 
-// static
-bool VendorCacheFile::load_vendor_profile(const std::string& path, const std::string& expected_vendor_name,
-                                          const Semver& expected_vendor_version, VendorProfile& vendor)
+template<class VersionSupplier>
+static bool read_vendor_profile(const std::string& path, const std::string& expected_vendor_name,
+                                VersionSupplier&& version_supplier, VendorProfile& vendor)
 {
     VendorMap vendors;
-    if (! read_cache_up_to_presets(path, expected_vendor_name, expected_vendor_version, vendors,
+    if (! read_cache_up_to_presets(path, expected_vendor_name, std::forward<VersionSupplier>(version_supplier), vendors,
                                    [](cereal::BinaryInputArchive&, const CacheDictionary&) {}))
         return false;
     vendor = std::move(vendors.find(expected_vendor_name)->second);
     return true;
+}
+
+// static
+bool VendorCacheFile::load(const std::string& path, const std::string& expected_vendor_name,
+                           const Semver& expected_vendor_version, VendorCacheData& data)
+{
+    return read_vendor_data(path, expected_vendor_name,
+        [&expected_vendor_version]() -> const Semver& { return expected_vendor_version; }, data);
+}
+
+// static
+bool VendorCacheFile::load_vendor_profile(const std::string& path, const std::string& expected_vendor_name,
+                                          const Semver& expected_vendor_version, VendorProfile& vendor)
+{
+    return read_vendor_profile(path, expected_vendor_name,
+        [&expected_vendor_version]() -> const Semver& { return expected_vendor_version; }, vendor);
+}
+
+// static
+bool VendorCacheFile::load(const std::string& path, const std::string& expected_vendor_name,
+                           const std::function<Semver()>& expected_vendor_version, VendorCacheData& data)
+{
+    return read_vendor_data(path, expected_vendor_name, expected_vendor_version, data);
+}
+
+// static
+bool VendorCacheFile::load_vendor_profile(const std::string& path, const std::string& expected_vendor_name,
+                                          const std::function<Semver()>& expected_vendor_version, VendorProfile& vendor)
+{
+    return read_vendor_profile(path, expected_vendor_name, expected_vendor_version, vendor);
 }
 
 // static

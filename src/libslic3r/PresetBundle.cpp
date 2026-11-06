@@ -8150,7 +8150,9 @@ PresetBundle::VendorRead PresetBundle::read_vendor(const std::string& dir, const
         // The cache is judged against the profile beside it, or, where the cache is the
         // whole of the installation, against nothing, since nothing on disk can then be
         // newer than it. That state is Semver::inf(), which no real profile carries.
-        const Semver version = has_profile ? get_version_from_json(profile.string()) : Semver::inf();
+        const auto version = [&profile, has_profile] {
+            return has_profile ? get_version_from_json(profile.string()) : Semver::inf();
+        };
         read.cache_path = (dir_path / (vendor_name + ".opc")).string();
         if (vendor_only) {
             VendorProfile vendor_profile;

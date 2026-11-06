@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -169,10 +170,18 @@ public:
     static bool load(const std::string& path, const std::string& expected_vendor_name,
                      const Semver& expected_vendor_version, VendorCacheData& data);
 
+    // Read an expected version only if the cache body can be read and verified.
+    // Invoked synchronously, never retained; supplier exceptions propagate.
+    static bool load(const std::string& path, const std::string& expected_vendor_name,
+                     const std::function<Semver()>& expected_vendor_version, VendorCacheData& data);
+
     // Read only the vendor's own profile, under the same checks as load(),
     // without deserializing its presets.
     static bool load_vendor_profile(const std::string& path, const std::string& expected_vendor_name,
                                     const Semver& expected_vendor_version, VendorProfile& vendor);
+
+    static bool load_vendor_profile(const std::string& path, const std::string& expected_vendor_name,
+                                    const std::function<Semver()>& expected_vendor_version, VendorProfile& vendor);
 
     // Read the profile version a cache was stamped with, without deserializing
     // its presets. Empty if the file is unreadable, not a cache this build
