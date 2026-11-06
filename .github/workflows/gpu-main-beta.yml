@@ -1,8 +1,8 @@
-name: orca-main experimental CUDA buffer reuse combined validation
+name: Orca main lazy vendor version exact-source validation
 
 on:
   push:
-    branches: [ci/orca-main-cuda-reuse-combined-20261106]
+    branches: [ci/orca-main-lazy-vendor-version-20261106]
   workflow_dispatch:
 
 concurrency:
@@ -161,6 +161,17 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python .github/gpu-validation/check_cuda_buffer_results.py --xml cuda-dispatch-buffers-app.xml --source tests/libslic3r/test_cuda_dispatch_buffers.cpp
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Validate lazy vendor version production contracts
+        shell: pwsh
+        run: |
+          $env:PATH = "$pwd/install-beta;$env:CUDA_PATH/bin;$env:PATH"
+          $env:SLIC3R_GPU_BACKEND = 'cpu'
+          $test = @(Get-ChildItem build-gpu -Recurse -File -Filter libslic3r_tests.exe)
+          if ($test.Count -ne 1) { throw 'Missing or ambiguous actual libslic3r test executable' }
+          & $test[0].FullName '[LazyVendorVersion]' --reporter xml --out "$pwd/lazy-vendor-version-app.xml"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python .github/gpu-validation/check_lazy_vendor_results.py --xml lazy-vendor-version-app.xml --source tests/libslic3r/test_vendor_cache.cpp
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Run full project tests and CPU diagnostic
         shell: pwsh
         run: |
@@ -222,6 +233,7 @@ jobs:
             package-sha256.txt
             full-app-tests.xml
             cuda-dispatch-buffers-app.xml
+            lazy-vendor-version-app.xml
             build-gpu/CMakeCache.txt
             build-gpu/Testing/Temporary/LastTest.log
       - uses: actions/upload-artifact@v6
