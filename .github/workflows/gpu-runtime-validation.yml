@@ -1,12 +1,16 @@
-name: GPU runtime validation
+name: Shared core CUDA buffer reuse validation
 
 on:
   push:
-    branches: [ci/gpu-runtime-validation]
+    branches: [ci/gpu-cuda-buffer-reuse-20261106]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   linux-contracts:
@@ -20,6 +24,22 @@ jobs:
       - run: cmake -S tests/gpu_safety -B build-gpu
       - run: cmake --build build-gpu --parallel 2
       - run: ctest --test-dir build-gpu --output-on-failure
+
+      - name: Run all registered CUDA buffer ownership contracts
+        run: |
+          set -euo pipefail
+          ./build-gpu/gpu_safety_tests '[CudaDispatchBuffers]' --order rand --rng-seed 9473 --reporter xml --out cuda-buffer-results.xml
+          python3 .github/gpu-validation/check_cuda_buffer_results.py --xml cuda-buffer-results.xml --source tests/libslic3r/test_cuda_dispatch_buffers.cpp > cuda-buffer-results-summary.json
+          cat cuda-buffer-results-summary.json
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cuda-buffer-reuse-contract-evidence-Linux
+          path: |
+            cuda-buffer-results.xml
+            cuda-buffer-results-summary.json
+            build-gpu/Testing/Temporary/LastTest.log
+            build-gpu/CMakeCache.txt
 
   windows-cuda-vulkan:
     runs-on: windows-2022
@@ -76,6 +96,14 @@ jobs:
           ctest --test-dir build-gpu -C Release --output-on-failure
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build-gpu/Release/slicer-gpu-selftest.exe build-gpu/resources/vulkan cpu
+      - name: Run all registered CUDA buffer ownership contracts
+        shell: pwsh
+        run: |
+          & build-gpu/Release/gpu_safety_tests.exe '[CudaDispatchBuffers]' --order rand --rng-seed 9473 --reporter xml --out cuda-buffer-results.xml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python .github/gpu-validation/check_cuda_buffer_results.py --xml cuda-buffer-results.xml --source tests/libslic3r/test_cuda_dispatch_buffers.cpp > cuda-buffer-results-summary.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-Content cuda-buffer-results-summary.json
       - name: Package kernel diagnostic and matching runtimes
         shell: pwsh
         run: |
@@ -94,9 +122,46 @@ jobs:
           if (Test-Path "$env:VULKAN_SDK/License") { Copy-Item "$env:VULKAN_SDK/License" gpu-diagnostic/licenses/VulkanSDK -Recurse }
           git rev-parse HEAD | Set-Content gpu-diagnostic/SOURCE-COMMIT.txt
           'This is a compute diagnostic, not the slicer app. Run slicer-gpu-selftest.exe resources/vulkan cuda or vulkan. Both must dispatch and validate; no speedup is claimed.' | Set-Content gpu-diagnostic/README.txt
+          $sourcePaths = @('src/libslic3r/Gpu','tests/gpu_safety','tests/libslic3r/test_gpu_exact_geometry.cpp','tests/libslic3r/test_gpu_batch_preflight.cpp','tests/libslic3r/test_cuda_dispatch_buffers.cpp','tests/libslic3r/CMakeLists.txt','docs/superpowers/plans/2026-11-06-cuda-buffer-reuse.md','.github/gpu-validation/check_cuda_buffer_results.py','.github/workflows/gpu-runtime-validation.yml','LICENSE.txt')
+          git -c core.autocrlf=false -c core.eol=lf archive --format=tar --output=gpu-diagnostic/source.tar HEAD -- $sourcePaths
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $sourceFiles = @(git ls-tree -r --name-only HEAD -- $sourcePaths)
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $members = @(tar -tf gpu-diagnostic/source.tar | Where-Object { $_ -and -not $_.EndsWith('/') })
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (@(Compare-Object ($sourceFiles | Sort-Object) ($members | Sort-Object)).Count) { throw 'Source archive membership differs from exact tracked source list' }
+          foreach ($required in @('src/libslic3r/Gpu/CudaDispatchBuffers.hpp','tests/libslic3r/test_cuda_dispatch_buffers.cpp','tests/gpu_safety/CMakeLists.txt')) {
+            if ($sourceFiles -notcontains $required) { throw "Required reviewed source missing: $required" }
+          }
+          git ls-tree -r HEAD -- $sourcePaths | Set-Content gpu-diagnostic/SOURCE-GIT-TREE.txt -Encoding utf8
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          (git rev-parse 'HEAD^{tree}').Trim() | Set-Content gpu-diagnostic/SOURCE-TREE.txt -Encoding ascii
+          "https://github.com/$env:GITHUB_REPOSITORY/tree/$env:GITHUB_SHA" | Set-Content gpu-diagnostic/SOURCE-URL.txt -Encoding ascii
+          Copy-Item cuda-buffer-results.xml,cuda-buffer-results-summary.json gpu-diagnostic
+          'Reviewed bounded CUDA allocation reuse. Host contracts and CI CPU fallback do not establish physical GPU correctness, allocation counts or slicer speed. No product app is included. Hardware validation remains pending.' | Set-Content gpu-diagnostic/BUFFER-REUSE-VALIDATION.txt -Encoding utf8
+          $manifest = @()
+          foreach ($file in @(Get-ChildItem gpu-diagnostic -Recurse -File | Sort-Object FullName)) {
+            $manifest += [ordered]@{path=[IO.Path]::GetRelativePath((Join-Path $pwd 'gpu-diagnostic'),$file.FullName).Replace([char]92,[char]47);bytes=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content gpu-diagnostic/FILE-SHA256.json -Encoding utf8
           Compress-Archive gpu-diagnostic GPU-kernel-diagnostic-Windows-sm61.zip
           Get-FileHash GPU-kernel-diagnostic-Windows-sm61.zip -Algorithm SHA256 | Format-List
+          $digest = (Get-FileHash GPU-kernel-diagnostic-Windows-sm61.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  GPU-kernel-diagnostic-Windows-sm61.zip" | Set-Content package-sha256.txt -Encoding ascii
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cuda-buffer-reuse-contract-evidence-Windows
+          path: |
+            cuda-buffer-results.xml
+            cuda-buffer-results-summary.json
+            build-gpu/Testing/Temporary/LastTest.log
+            build-gpu/CMakeCache.txt
+            gpu-diagnostic/FILE-SHA256.json
+            gpu-diagnostic/SOURCE-GIT-TREE.txt
+            gpu-diagnostic/SOURCE-TREE.txt
+            package-sha256.txt
       - uses: actions/upload-artifact@v6
         with:
-          name: gpu-kernel-diagnostic-windows-sm61
+          name: gpu-cuda-buffer-reuse-windows-sm61
           path: GPU-kernel-diagnostic-Windows-sm61.zip
